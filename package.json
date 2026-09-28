@@ -1,0 +1,27 @@
+{
+  "name": "uzgrow-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram mijozlar boti + operator/menejerlar boti (Vercel + Supabase)",
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "migrate": "tsx --env-file=.env scripts/migrate.ts",
+    "dev": "tsx --env-file=.env scripts/dev-server.ts",
+    "setup": "tsx --env-file=.env scripts/setup.ts",
+    "test": "tsx --env-file=.env tests/e2e.test.ts",
+    "test:fake": "tsx tests/fake-telegram.selftest.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3"
+  }
+}

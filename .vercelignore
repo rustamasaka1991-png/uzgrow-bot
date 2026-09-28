@@ -1,0 +1,6 @@
+# Deploy qilinmaydigan fayllar (maxfiy kalitlar va faqat lokal kerak bo'ladiganlar)
+.env
+.env.*
+!.env.example
+tests
+*.tmp.*
