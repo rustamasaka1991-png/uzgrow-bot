@@ -47,17 +47,20 @@ import { buildTranscript } from './staff/transcript.js';
 import {
   BTN,
   CAPTION_LIMIT,
+  CLIENT_LINK_HINT,
   ERROR_TEXT,
   INACTIVE_TEXT,
   NOT_STAFF_TEXT,
   STALE_BUTTON_TEXT,
   callbackMessage,
+  clientLinkOf,
   isCommandMessage,
   logError,
   mainKeyboard,
   parseId,
   render,
   sendHtml,
+  shareUrl,
   stripKeyboard,
   type StaffContext,
   type View,
@@ -224,7 +227,7 @@ async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
 
   const me = ctx.staff;
   if (me) {
-    await sendHtml(ctx, staffWelcomeText(me, ctx.admin), { markup: mainKeyboard(me, ctx.admin) });
+    await sendHtml(ctx, staffWelcomeText(me, ctx.admin, await clientLinkOf(me)), { markup: mainKeyboard(me, ctx.admin) });
     await sendWebAppHint(ctx);
     return;
   }
@@ -243,15 +246,21 @@ async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
   await sendHtml(ctx, NOT_STAFF_TEXT, { markup: { remove_keyboard: true } });
 }
 
-function staffWelcomeText(me: Staff, admin: boolean): string {
+function staffWelcomeText(me: Staff, admin: boolean, clientLink: string): string {
   const lines = [
     `👋 Assalomu alaykum, <b>${esc(me.full_name)}</b>!`,
     '',
     `Siz <b>${roleIcon(me.role)} ${roleLabel(me.role)}</b> sifatida ishlaysiz. Mijozlar sizga yozgan xabarlar shu yerga keladi.`,
     '',
+  ];
+  if (clientLink) {
+    const hint = me.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz faollashtirilgach ishlaydi.';
+    lines.push(`🔗 Mijozlar uchun havolangiz: ${esc(clientLink)}`, `<i>${esc(hint)}</i>`, '');
+  }
+  lines.push(
     `${me.is_online ? '🟢 Holatingiz: <b>onlayn</b>' : '⚪️ Holatingiz: <b>oflayn</b>'} (o'zgartirish — «${BTN.status}»)`,
     '✍️ Javob berish uchun mijoz xabariga <b>Reply</b> qiling yoki «↩️ Javob berish» tugmasini bosing.',
-  ];
+  );
   if (!me.is_active) {
     lines.push(
       '',
@@ -295,17 +304,29 @@ async function handleInvite(ctx: StaffContext, code: string): Promise<void> {
 
   const s = res.staff;
   ctx.staff = s;
+  const clientLink = await clientLinkOf(s);
   const lines = [
     `✅ Tabriklaymiz! Siz <b>${esc(s.full_name)}</b> (${roleLabel(s.role)}) profiliga muvaffaqiyatli ulandingiz.`,
     '',
     '📩 Endi mijozlar sizni menyuda ko\'radi va yozgan xabarlari shu yerga keladi.',
     '',
+  ];
+  if (clientLink) {
+    lines.push(
+      '🔗 <b>Mijozlar uchun havolangiz:</b>',
+      esc(clientLink),
+      esc(s.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz faollashtirilgach ishlaydi.'),
+      `<i>📋 Nusxalash va ulashish — «${BTN.profile}» da.</i>`,
+      '',
+    );
+  }
+  lines.push(
     '<b>Qanday javob beriladi?</b>',
     '• Mijoz xabariga <b>Reply</b> qiling, yoki',
     '• xabar ostidagi «↩️ Javob berish» tugmasini bosing — keyingi xabarlaringiz shu mijozga boradi.',
     '',
     `💬 Barcha suhbatlar — «${BTN.chats}», holatingiz — «${BTN.status}».`,
-  ];
+  );
   if (!s.is_active) {
     lines.push(
       '',
@@ -629,12 +650,13 @@ async function toggleStatus(ctx: StaffContext): Promise<void> {
 async function showProfile(ctx: StaffContext): Promise<void> {
   const me = await requireStaff(ctx);
   if (!me) return;
-  const [counts, greeting] = await Promise.all([
+  const [counts, greeting, clientLink] = await Promise.all([
     db()<{ chats: number; unread: number }[]>`
       select count(*) filter (where last_message_at is not null)::int as chats,
              coalesce(sum(unread_staff), 0)::int as unread
       from conversations where staff_id = ${me.id}`,
     greetingText(me, { first_name: '' }),
+    clientLinkOf(me),
   ]);
   const stats = counts[0] ?? { chats: 0, unread: 0 };
 
@@ -651,6 +673,17 @@ async function showProfile(ctx: StaffContext): Promise<void> {
         ? '✅ Profil faol — mijozlar sizni menyuda ko\'radi'
         : "⛔ Profil o'chirib qo'yilgan — mijozlar sizni ko'rmaydi, siz ham ularga yoza olmaysiz",
       `💬 Chatlar: <b>${stats.chats}</b>${stats.unread ? ` (o'qilmagan: ${stats.unread})` : ''}`,
+    );
+    if (clientLink) {
+      lines.push(
+        '',
+        `🔗 Mijozlar uchun havolangiz: ${esc(clientLink)}`,
+        me.is_active
+          ? "Mijoz shu havola orqali kirsa, darhol siz bilan chat boshlanadi."
+          : "Profilingiz faollashtirilgach ishlaydi.",
+      );
+    }
+    lines.push(
       '',
       `🤖 <b>Avto-javob</b> ${me.greeting ? '(shaxsiy)' : '(standart)'}:`,
       `<blockquote>${esc(truncate(greeting, greetMax))}</blockquote>`,
@@ -660,8 +693,10 @@ async function showProfile(ctx: StaffContext): Promise<void> {
     return lines.join('\n');
   };
 
+  const kb = new InlineKeyboard();
+  if (clientLink) kb.copyText('📋 Nusxalash', clientLink).url('📤 Ulashish', shareUrl(clientLink)).row();
   // `:n` — profil kartasi (rasm) chatlar ro'yxatiga almashtirilib, o'chib ketmasin
-  const kb = new InlineKeyboard().text('💬 Chatlar', 'chats:0:n');
+  kb.text('💬 Chatlar', 'chats:0:n');
   const fullText = build(700, 1200);
   if (me.photo_file_id) {
     let caption = build(300, 300);
@@ -677,13 +712,16 @@ async function showProfile(ctx: StaffContext): Promise<void> {
 // ── ℹ️ Yordam ──
 
 async function showHelp(ctx: StaffContext): Promise<void> {
-  const url = await getWebAppUrl();
+  const [url, clientLink] = await Promise.all([getWebAppUrl(), ctx.staff ? clientLinkOf(ctx.staff) : Promise.resolve('')]);
   const parts: string[] = [];
   if (ctx.staff) {
     parts.push(
       'ℹ️ <b>Bot qanday ishlaydi?</b>',
       '',
       '📩 Mijozlar sizga mijozlar boti orqali yozadi — xabarlari shu yerga keladi. Har bir xabar tepasida mijoz ismi bo\'ladi, yangi mijoz esa 🆕 bilan belgilanadi.',
+      '',
+      '🔗 <b>Shaxsiy havolangiz</b>' + (clientLink ? `: ${esc(clientLink)}` : ` — «${BTN.profile}» da.`),
+      `Uni mijozlarga bering: havola orqali kirgan mijoz hech narsa tanlamasdan darhol siz bilan yozishadi. Nusxalash va ulashish — «${BTN.profile}».`,
       '',
       '✍️ <b>Javob berishning 3 usuli:</b>',
       '1. Mijoz xabariga <b>Reply</b> (javob) qiling — eng ishonchli usul;',
@@ -714,13 +752,15 @@ async function showHelp(ctx: StaffContext): Promise<void> {
       '2. Xodim kartasidagi taklif havolasini o\'sha xodimga yuboring — u havolani bosib, Telegram akkauntini ulaydi.',
       '3. Ulangan va faol xodimlarni mijozlar menyuda ko\'radi va ular bilan yozishadi.',
       '',
+      '🔗 Har bir xodimning <b>mijozlar uchun shaxsiy havolasi</b> bor (kartada): mijoz shu havola orqali kirsa, hech narsa tanlamasdan darhol o\'sha xodim bilan chat boshlanadi. Nomini «✏️ Havola nomi» tugmasi bilan o\'zgartirasiz.',
+      '',
       '🔒 Mijoz va xodim o\'rtasidagi yozishmalar maxfiy — ularni faqat o\'sha xodim ko\'radi.',
       '',
       'Buyruqlar: /admin, /cancel, /help',
     );
   }
   if (ctx.staff && ctx.admin) {
-    parts.push('', `⚙️ <b>Admin</b>: «${BTN.admin}» — xodimlarni qo'shish/tahrirlash, taklif havolalari, matnlar va statistika.`);
+    parts.push('', `⚙️ <b>Admin</b>: «${BTN.admin}» — xodimlarni qo'shish/tahrirlash, taklif va mijoz havolalari, matnlar va statistika.`);
   }
   await sendHtml(ctx, parts.join('\n'), { markup: mainKeyboard(ctx.staff, ctx.admin) });
 }

@@ -2,7 +2,7 @@
 import { webhookSecretFor } from './auth.js';
 import { config } from './config.js';
 import { db } from './db.js';
-import { setSetting } from './repo.js';
+import { ensureLinkCodes, setSetting } from './repo.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
 import { SETTING_KEYS } from './texts.js';
 import type { Api } from 'grammy';
@@ -21,10 +21,14 @@ export async function migrate(): Promise<void> {
     const t = tx as unknown as typeof sql;
     await t`select pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`;
     await t.unsafe(SCHEMA_SQL);
-    await t`
-      insert into settings (key, value, updated_at) values (${SCHEMA_VERSION_KEY}, ${SCHEMA_VERSION}, now())
-      on conflict (key) do update set value = excluded.value, updated_at = now()`;
   });
+  // Eski xodimlarga mijoz havolasi nomi (link_code) berish — idempotent. Tranzaksiyadan keyin (u staff jadvalini
+  // DDL bilan qulflaydi). Sxema versiyasi shundan KEYIN yoziladi: to'ldirish xato bersa, ensureSchema keyingi
+  // so'rovda migratsiyani qayta bajaradi (aks holda eski xodimlar havola nomisiz qolib ketardi).
+  await ensureLinkCodes();
+  await sql`
+    insert into settings (key, value, updated_at) values (${SCHEMA_VERSION_KEY}, ${SCHEMA_VERSION}, now())
+    on conflict (key) do update set value = excluded.value, updated_at = now()`;
 }
 
 let schemaReady: Promise<void> | null = null;
@@ -61,12 +65,9 @@ export function ensureSchema(): Promise<void> {
  */
 export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'my_chat_member'] as const;
 
+/** Mijozlar boti sodda: faqat boshlash va yordam (Mini App yo'q — menyu tugmasi buyruqlar ro'yxati). */
 const CLIENT_COMMANDS = [
-  { command: 'start', description: 'Botni ishga tushirish' },
-  { command: 'menu', description: 'Asosiy menyu' },
-  { command: 'operators', description: '👨‍💻 Operatorlar' },
-  { command: 'managers', description: '👔 Menejerlar' },
-  { command: 'chats', description: '💬 Suhbatlarim' },
+  { command: 'start', description: '🔄 Boshlash / xodim tanlash' },
   { command: 'help', description: 'ℹ️ Yordam' },
 ];
 
@@ -195,12 +196,12 @@ async function setupBot(kind: BotKind, appUrl: string): Promise<BotSetupResult> 
       // Admin botni hali ochmagan bo'lsa ("chat not found") — /start bosganda o'rnatiladi
       for (const id of config.adminIds) await setAdminCommands(api, id).catch(() => {});
     }
+    // Mijozlarda Mini App yo'q: menyu tugmasi oddiy buyruqlar ro'yxati. Xodimlarda — «💬 Chatlar» Mini App.
     await api.setChatMenuButton({
-      menu_button: {
-        type: 'web_app',
-        text: kind === 'client' ? '📱 Menyu' : '💬 Chatlar',
-        web_app: { url: `${appUrl}/app/` },
-      },
+      menu_button:
+        kind === 'client'
+          ? { type: 'commands' }
+          : { type: 'web_app', text: '💬 Chatlar', web_app: { url: `${appUrl}/app/` } },
     });
     if (kind === 'client') {
       await api

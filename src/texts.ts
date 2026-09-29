@@ -17,6 +17,10 @@ export const STAFF_NOTICE = {
     `🔌 Akkauntingiz <b>${esc(truncate(name, 100))}</b> xodim profilidan uzildi. Endi mijozlar xabarlari sizga kelmaydi.`,
   deleted: (name: string): string =>
     `🗑 <b>${esc(truncate(name, 100))}</b> xodim profili o'chirildi. Endi mijozlar xabarlari sizga kelmaydi.`,
+  /** Admin xodimning mijozlar uchun havola nomini o'zgartirdi — eski havola endi ishlamaydi. */
+  linkChanged: (link: string): string =>
+    `🔗 Admin mijozlar uchun havolangizni o'zgartirdi:\n${esc(link)}\n\n` +
+    'Eski havola endi ishlamaydi — mijozlaringizga yangisini bering.',
 } as const;
 
 export const SETTING_KEYS = {
@@ -30,11 +34,7 @@ export const SETTING_KEYS = {
 /** Mijoz /start bosganda. {name} — mijoz ismi. Oddiy matn (HTML emas). */
 export const DEFAULT_WELCOME =
   'Assalomu alaykum, {name}! 👋\n\n' +
-  'Botimizga xush kelibsiz. Bu yerda siz o\'zingizga kerakli operator yoki menejerni tanlab, ' +
-  'u bilan to\'g\'ridan-to\'g\'ri yozishishingiz mumkin.\n\n' +
-  '👨‍💻 Operatorlar — savollar va texnik yordam\n' +
-  '👔 Menejerlar — buyurtma, hamkorlik va takliflar\n\n' +
-  '👇 Pastdagi tugmalardan tanlang yoki «📱 Menyu» ni oching.';
+  "Kim bilan bog'lanmoqchisiz? Quyidan tanlang 👇";
 
 /**
  * Mijoz xodimga birinchi marta yozganda avtomatik javob. {name} — mijoz, {staff} — xodim ismi.
@@ -57,8 +57,21 @@ export function fill(template: string, vars: Record<string, string>): string {
   return template.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? vars[k]! : m));
 }
 
+/**
+ * v1 dagi standart salomlashuv (u «📱 Menyu» va pastki tugmalarni tilga oladi — v2 da ular yo'q). Admin uni aynan
+ * shu ko'rinishda sozlamaga saqlagan bo'lsa ham, mijozga yangi standart matn ko'rsatiladi.
+ */
+const LEGACY_DEFAULT_WELCOME =
+  'Assalomu alaykum, {name}! 👋\n\n' +
+  "Botimizga xush kelibsiz. Bu yerda siz o'zingizga kerakli operator yoki menejerni tanlab, " +
+  "u bilan to'g'ridan-to'g'ri yozishishingiz mumkin.\n\n" +
+  '👨‍💻 Operatorlar — savollar va texnik yordam\n' +
+  '👔 Menejerlar — buyurtma, hamkorlik va takliflar\n\n' +
+  '👇 Pastdagi tugmalardan tanlang yoki «📱 Menyu» ni oching.';
+
 export async function welcomeText(client: Pick<Client, 'first_name'>): Promise<string> {
-  const tpl = (await getSetting(SETTING_KEYS.welcome)) || DEFAULT_WELCOME;
+  const saved = (await getSetting(SETTING_KEYS.welcome))?.replace(/\r\n?/g, '\n').trim();
+  const tpl = saved && saved !== LEGACY_DEFAULT_WELCOME ? saved : DEFAULT_WELCOME;
   return truncate(fill(tpl, { name: client.first_name || 'mehmon' }), MESSAGE_LIMIT);
 }
 

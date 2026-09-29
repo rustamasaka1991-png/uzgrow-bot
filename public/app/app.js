@@ -1,4 +1,5 @@
-/* Uzgrow Mini App — mijozlar, xodimlar va admin uchun yagona interfeys.
+/* Uzgrow Mini App — xodimlar va admin uchun interfeys (mijozlar uchun o'chirilgan: ular bot chatida yozadi;
+ * mijozlar boti orqali ochilsa server 403 client_app_disabled qaytaradi va "Chatga qaytish" ekrani ko'rsatiladi).
  * Vanilla JS, build bosqichisiz. Tashqi skript faqat: https://telegram.org/js/telegram-web-app.js
  * API shartnomasi: POST /api/app  { initData, action, ...params }  →  { ok: true, ... } | { ok: false, error, message }
  */
@@ -27,6 +28,7 @@
     notStaff: "Bu bo'lim faqat xodimlar uchun. Admin bergan taklif havolasi orqali xodimlar botiga kiring.",
     undelivered: 'Saqlandi, lekin mijozga yetkazilmadi',
     staffInactive: "Profilingiz o'chirib qo'yilgan — mijozlarga xabar yubora olmaysiz. Admin bilan bog'laning.",
+    clientAppDisabled: 'Bu ilova faqat xodimlar uchun. Iltimos, bot chatiga qayting va shu yerda yozing.',
   };
 
   function readDevInitData() {
@@ -633,6 +635,96 @@
     }
   }
 
+  // ═══════════════════════════ Mijozlar uchun shaxsiy havola ═══════════════════════════
+  // Har bir xodimning qisqa havolasi: https://t.me/<mijoz_boti>?start=<link_code> (masalan ...?start=aziza).
+  // Mijoz shu havola orqali botga kirsa — hech narsa tanlamasdan shu xodim bilan chat boshlanadi.
+
+  /** Server bilan bir xil qoida (src/repo.ts LINK_CODE_RE): 2–32 ta kichik lotin harfi, raqam yoki "_". */
+  const LINK_CODE_RE = /^[a-z0-9_]{2,32}$/;
+  const LINK_SHARE_TEXT = "Men bilan shu havola orqali bog'laning";
+  const CLIENT_LINK_RE = /^https:\/\/t\.me\/([A-Za-z0-9_]{3,64})\?start=([A-Za-z0-9_]{1,64})$/;
+
+  function normalizeLinkCode(v) {
+    return str(v).trim().toLowerCase().replace(/^@/, '');
+  }
+
+  /** Havola nomidagi xato matni ('' — to'g'ri). */
+  function linkCodeError(code) {
+    if (!code) return 'Havola nomini kiriting.';
+    if (/^staff_\d+$/.test(code)) return "Bu nom tizim uchun band — boshqa nom yozing.";
+    if (!LINK_CODE_RE.test(code)) return "Havola nomi 2–32 ta lotin harfi, raqam yoki _ bo'lishi kerak (masalan: aziza).";
+    return '';
+  }
+
+  const CYR_TO_LAT = {
+    а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'j', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l',
+    м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'x', ц: 's', ч: 'ch', ш: 'sh',
+    щ: 'sh', ъ: '', ы: 'i', ь: '', э: 'e', ю: 'yu', я: 'ya', ў: 'o', қ: 'q', ғ: 'g', ҳ: 'h',
+  };
+
+  /** Ismdan taxminiy havola nomi (serverdagi avtomatik nom bilan bir xil qoida; band bo'lsa server raqam qo'shadi). */
+  function linkCodeSuggestion(fullName) {
+    const first = str(fullName).trim().split(/\s+/)[0] || '';
+    let out = '';
+    Array.from(first.toLowerCase()).forEach((ch) => {
+      out += Object.prototype.hasOwnProperty.call(CYR_TO_LAT, ch) ? CYR_TO_LAT[ch] : ch;
+    });
+    try {
+      out = out.normalize('NFKD');
+    } catch (e) {
+      /* eski brauzer */
+    }
+    out = out.replace(/[^a-z0-9]/g, '').slice(0, 24);
+    return out.length >= 2 ? out : 'xodim';
+  }
+
+  /** Faqat t.me havolasi (serverdan kelgan qiymat ekranga/ulashishga shu tekshiruvdan keyin chiqadi). */
+  function safeClientLink(v) {
+    const link = str(v).trim();
+    return CLIENT_LINK_RE.test(link) ? link : '';
+  }
+
+  /** Mijozlar boti username i: havoladan yoki bootstrap/admin ro'yxatidagi client_bot dan. */
+  function clientBotName(link) {
+    const m = CLIENT_LINK_RE.exec(str(link));
+    if (m) return m[1];
+    if (S.clientBot) return S.clientBot;
+    // Zaxira: ro'yxatdagi istalgan xodim havolasidan yoki o'z profilidan
+    const known = A.staff.map((x) => x.client_link).concat(S.me ? [S.me.client_link] : []);
+    for (let i = 0; i < known.length; i++) {
+      const k = CLIENT_LINK_RE.exec(str(known[i]));
+      if (k) return k[1];
+    }
+    return '';
+  }
+
+  async function copyLink(link) {
+    const ok = await copyText(link);
+    if (ok) {
+      toast('Havola nusxalandi 📋', 'success', 2000);
+      haptic.notify('success');
+    } else {
+      toast("Nusxalab bo'lmadi — havolani bosib turib, qo'lda nusxalang.", 'error');
+    }
+  }
+
+  /** Telegram "Ulashish" oynasi (t.me/share/url — Telegram ichida openTelegramLink orqali ochiladi). */
+  function shareLink(link, text) {
+    if (!/^https:\/\//.test(str(link))) return;
+    openLink('https://t.me/share/url?url=' + encodeURIComponent(link) + '&text=' + encodeURIComponent(text || LINK_SHARE_TEXT));
+  }
+
+  /** Havola qutisi: to'liq havola (bosilsa nusxalanadi) + "📋 Nusxalash" va "📤 Ulashish" tugmalari. */
+  function clientLinkBox(link, shareText) {
+    return h('div', { class: 'invite-box client-link-box' }, [
+      h('button', { class: 'invite-link', type: 'button', 'aria-label': 'Havolani nusxalash', onclick: () => copyLink(link), text: link }),
+      h('div', { class: 'invite-actions' }, [
+        h('button', { class: 'btn sm secondary', type: 'button', onclick: () => copyLink(link) }, '📋 Nusxalash'),
+        h('button', { class: 'btn sm', type: 'button', onclick: () => shareLink(link, shareText) }, '📤 Ulashish'),
+      ]),
+    ]);
+  }
+
   // ═══════════════════════════ Toastlar va holat oynalari ═══════════════════════════
 
   const toastsEl = document.getElementById('toasts');
@@ -729,9 +821,11 @@
   let sessionDead = false;
   // Xodim profili uzildi/o'chirildi (403 not_staff): barcha so'rovlar to'xtatiladi, maxfiy ma'lumotlar ekrandan olinadi
   let accessDead = false;
+  // Mini App mijozlar boti orqali ochilgan (403 client_app_disabled): mijozlar uchun ilova o'chirilgan
+  let clientDisabled = false;
 
   function sessionExpired() {
-    if (sessionDead || accessDead) return;
+    if (sessionDead || accessDead || clientDisabled) return;
     sessionDead = true;
     poller.stop();
     netBanner(false);
@@ -749,7 +843,7 @@
    * So'rovlar to'xtatiladi, ochiq ekranlar yopiladi, suhbatlar va admin ma'lumotlari xotiradan tozalanadi.
    */
   function accessRevoked(text) {
-    if (accessDead || sessionDead) return;
+    if (accessDead || sessionDead || clientDisabled) return;
     accessDead = true;
     poller.stop();
     netBanner(false);
@@ -774,8 +868,34 @@
     });
   }
 
+  /**
+   * Mijozlar uchun Mini App o'chirilgan: mijoz bot chatida yozadi. Do'stona to'liq ekranli xabar va
+   * "Chatga qaytish" tugmasi (Mini App ni yopadi). So'rovlar, qayta urinishlar va polling to'xtatiladi.
+   */
+  function clientAppDisabled(text) {
+    if (clientDisabled) return;
+    clientDisabled = true;
+    poller.stop();
+    netBanner(false);
+    outboxClear();
+    nav.teardown();
+    S.convs = [];
+    S.extraConvs.clear();
+    S.listSig = null;
+    S.me = null;
+    S.staff = [];
+    mediaUrls.clear();
+    showFatal({
+      emoji: '💬',
+      title: 'Bot chatida yozing',
+      text: text || MSG.clientAppDisabled,
+      actions: [{ label: 'Chatga qaytish', fn: closeApp }],
+    });
+  }
+
   /** Sessiya tugagan yoki kirish taqiqlangan bo'lsa — darhol qaytariladigan xato. */
   function deadError() {
+    if (clientDisabled) return new ApiError('client_app_disabled', MSG.clientAppDisabled, 403);
     if (sessionDead) return new ApiError('unauthorized', MSG.session, 401);
     if (accessDead) return new ApiError('not_staff', MSG.notStaff, 403);
     return null;
@@ -811,7 +931,8 @@
   function handleResponse(status, data) {
     if (status >= 200 && status < 300 && data && typeof data === 'object' && data.ok !== false) return data;
     const err = errorFrom(status, data);
-    if (status === 401 || err.code === 'unauthorized') sessionExpired();
+    if (err.code === 'client_app_disabled') clientAppDisabled(err.message);
+    else if (status === 401 || err.code === 'unauthorized') sessionExpired();
     // Faqat aniq 'not_staff' — butun sessiya uchun kirish yo'q. 'forbidden', 'staff_only', 'admin_only'
     // kabi kodlar alohida amal/suhbat uchun rad etish, ular chaqiruvchida ko'rsatiladi.
     else if (err.code === 'not_staff') accessRevoked();
@@ -905,7 +1026,7 @@
   }
 
   function reportError(e) {
-    if (!e || e.status === 401 || sessionDead || accessDead || e.code === 'not_staff') return;
+    if (!e || e.status === 401 || sessionDead || accessDead || clientDisabled || e.code === 'not_staff' || e.code === 'client_app_disabled') return;
     toast(e.message || MSG.generic, 'error');
     haptic.notify('error');
   }
@@ -916,6 +1037,7 @@
     role: null, // 'client' | 'staff'
     me: null,
     isAdmin: false,
+    clientBot: '', // mijozlar boti username i (shaxsiy havolalar prefiksi uchun)
     staff: [], // mijoz uchun: StaffCard[]
     convs: [], // ConvSummary[]
     total: 0,
@@ -998,6 +1120,9 @@
       tg_username: str(s.tg_username),
       // Xodim profili (Mini App "Profil"): o'chirib qo'yilgan xodim mijozlarga yoza olmaydi
       is_active: s.is_active !== false,
+      // Mijozlar uchun shaxsiy havola (t.me/<mijoz_boti>?start=<link_code>)
+      link_code: s.link_code ? str(s.link_code) : null,
+      client_link: safeClientLink(s.client_link),
     };
   }
 
@@ -1104,6 +1229,7 @@
       S.staff = arr(res.staff).map(normStaffCard).filter((s) => s.id);
       bus.emit('staff');
     } else {
+      if (typeof res.client_bot === 'string' && /^[A-Za-z0-9_]{3,64}$/.test(res.client_bot)) S.clientBot = res.client_bot;
       const me = res.me ? normStaffCard(res.me) : null;
       const admin = !!res.is_admin;
       if (isRefresh && !me && !admin) {
@@ -1601,7 +1727,7 @@
         }
       } catch (e) {
         // Sessiya tugagan yoki xodimga kirish yopilgan — tarmoq xatosi emas (ekran allaqachon almashtirilgan)
-        if (e.status === 401 || e.code === 'not_staff' || sessionDead || accessDead) return;
+        if (e.status === 401 || e.code === 'not_staff' || sessionDead || accessDead || clientDisabled) return;
         if (chat && params.conversationId && (e.status === 403 || e.status === 404)) chat.onAccessLost(e);
         else {
           this.failures++;
@@ -1796,237 +1922,6 @@
     }
 
     return { el: el, update: update };
-  }
-
-  // ═══════════════════════════ Mijoz: asosiy ekran ═══════════════════════════
-
-  function ClientRoot() {
-    const firstName = firstWord((S.me && S.me.first_name) || USER.first_name);
-    const titleEl = h('h1', { class: 'topbar-title', text: firstName ? 'Salom, ' + firstName + ' 👋' : 'Assalomu alaykum 👋' });
-    const subtitleEl = h('div', { class: 'topbar-sub', text: 'Kim bilan yozishmoqchisiz?' });
-    const root = TabbedRoot({
-      titleEl: titleEl,
-      subtitleEl: subtitleEl,
-      tabs: [
-        { id: 'operator', emoji: '👨‍💻', label: 'Operatorlar' },
-        { id: 'manager', emoji: '👔', label: 'Menejerlar' },
-        { id: 'chats', emoji: '💬', label: 'Suhbatlar' },
-      ],
-      onTab: (id) => {
-        if (id !== 'chats') measureClamps(root.panel(id));
-      },
-    });
-
-    const staffLists = {};
-    const cardCache = new Map();
-    ['operator', 'manager'].forEach((role) => {
-      const cards = h('div', { class: 'cards' });
-      const empty = emptyState(
-        role === 'manager' ? '👔' : '👨‍💻',
-        role === 'manager' ? "Hozircha menejerlar yo'q" : "Hozircha operatorlar yo'q",
-        "Tez orada bu yerda mutaxassislarimiz paydo bo'ladi. Iltimos, keyinroq qayta tekshiring.",
-      );
-      root.panel(role).appendChild(cards);
-      root.panel(role).appendChild(empty);
-      staffLists[role] = { cards: cards, empty: empty };
-    });
-
-    const convList = ConvList({ onOpen: (c) => openClientChat(c, null) });
-    const convEmpty = emptyState('💬', "Hali suhbatlar yo'q", 'Operator yoki menejerni tanlab, birinchi xabaringizni yozing — suhbat shu yerda saqlanadi.', [
-      h('button', { class: 'btn sm secondary', type: 'button', onclick: () => root.select('operator', true) }, '👨‍💻 Operatorlar'),
-      h('button', { class: 'btn sm secondary', type: 'button', onclick: () => root.select('manager', true) }, '👔 Menejerlar'),
-    ]);
-    root.panel('chats').appendChild(convList.el);
-    root.panel('chats').appendChild(convEmpty);
-
-    function staffUnread(s) {
-      const c = S.convs.find((x) => x.staff_id === s.id);
-      return c ? unreadOf(c) : s.unread;
-    }
-
-    function hasHistory(s) {
-      const c = S.convs.find((x) => x.staff_id === s.id);
-      return !!(c && c.last_message_at);
-    }
-
-    function cardFor(s) {
-      const unread = staffUnread(s);
-      const history = hasHistory(s);
-      const sig = JSON.stringify([s.full_name, s.role_label, s.position, s.description, s.is_online, s.photo_url, unread, history]);
-      const cached = cardCache.get(s.id);
-      if (cached && cached.sig === sig) return cached.el;
-      const desc = s.description ? h('p', { class: 'scard-desc clamp', text: s.description }) : null;
-      const more = desc ? h('button', { class: 'more-btn', type: 'button', hidden: true, 'aria-expanded': 'false' }, 'Batafsil') : null;
-      if (more) {
-        if (cached && cached.open) {
-          desc.classList.add('open');
-          more.textContent = "Yig'ish";
-          more.setAttribute('aria-expanded', 'true');
-        }
-        more.addEventListener('click', () => {
-          const open = desc.classList.toggle('open');
-          more.textContent = open ? "Yig'ish" : 'Batafsil';
-          more.setAttribute('aria-expanded', open ? 'true' : 'false');
-          const c = cardCache.get(s.id);
-          if (c) c.open = open;
-        });
-      }
-      const ava = avatar({ url: s.photo_url, name: s.full_name, seed: s.id, size: 72, online: s.is_online });
-      const avaEl = s.photo_url
-        ? h('button', { class: 'ava-btn', type: 'button', 'aria-label': s.full_name + ' rasmi', onclick: () => openViewer(s.photo_url, { alt: s.full_name }) }, ava)
-        : ava;
-      const el = h('article', { class: 'scard', 'aria-label': s.full_name }, [
-        h('div', { class: 'scard-top' }, [
-          avaEl,
-          h('div', { class: 'scard-info' }, [
-            h('h3', { class: 'scard-name', text: s.full_name }),
-            h('div', { class: 'scard-meta' }, [
-              h('span', { class: 'badge role-' + s.role, text: roleEmoji(s.role) + ' ' + s.role_label }),
-              h('span', { class: 'badge ' + (s.is_online ? 'on' : 'off'), text: s.is_online ? 'Onlayn' : 'Oflayn' }),
-            ]),
-            s.position ? h('div', { class: 'scard-pos', text: s.position }) : null,
-          ]),
-        ]),
-        desc,
-        more,
-        h('button', { class: 'btn block', type: 'button', onclick: () => openClientChat(null, s) }, history ? '💬 Suhbatni davom ettirish' : '✍️ Yozish'),
-        unread ? h('span', { class: 'count scard-unread', text: fmtCount(unread), 'aria-label': unread + " ta o'qilmagan" }) : null,
-      ]);
-      cardCache.set(s.id, { el: el, sig: sig, open: cached ? cached.open : false });
-      return el;
-    }
-
-    function renderStaff() {
-      ['operator', 'manager'].forEach((role) => {
-        const list = S.staff.filter((s) => s.role === role);
-        const box = staffLists[role];
-        list.forEach((s, i) => {
-          const el = cardFor(s);
-          const at = box.cards.children[i];
-          if (at !== el) box.cards.insertBefore(el, at || null);
-        });
-        while (box.cards.children.length > list.length) box.cards.lastChild.remove();
-        box.empty.hidden = list.length > 0;
-        box.cards.hidden = list.length === 0;
-      });
-      const alive = new Set(S.staff.map((s) => s.id));
-      cardCache.forEach((v, id) => {
-        if (!alive.has(id)) cardCache.delete(id);
-      });
-      const cur = root.current();
-      if (cur && cur !== 'chats') measureClamps(root.panel(cur));
-    }
-
-    function renderConvs() {
-      const list = S.convs.filter((c) => c.last_message_at || c.is_active);
-      convList.update(list);
-      convEmpty.hidden = list.length > 0;
-      root.setBadge('chats', totalUnread());
-    }
-
-    const unsubs = [
-      bus.on('staff', renderStaff),
-      bus.on('convs', () => {
-        renderConvs();
-        renderStaff();
-      }),
-    ];
-    const onResize = debounce(() => {
-      const cur = root.current();
-      if (cur && cur !== 'chats') measureClamps(root.panel(cur));
-    }, 200);
-    window.addEventListener('resize', onResize);
-
-    renderStaff();
-    renderConvs();
-    const saved = storage.get('tab', null);
-    const hasUnread = totalUnread() > 0;
-    root.select(hasUnread ? 'chats' : saved || 'operator', false);
-
-    return {
-      type: 'root',
-      el: root.el,
-      root: root,
-      onShow() {
-        renderConvs();
-      },
-      destroy() {
-        unsubs.forEach((u) => u());
-        onResize.cancel();
-        window.removeEventListener('resize', onResize);
-      },
-    };
-  }
-
-  function measureClamps(scope) {
-    if (!scope) return;
-    requestAnimationFrame(() => {
-      const els = scope.querySelectorAll('.clamp');
-      for (let i = 0; i < els.length; i++) {
-        const d = els[i];
-        const btn = d.nextElementSibling;
-        if (!btn || !btn.classList.contains('more-btn')) continue;
-        if (d.classList.contains('open')) {
-          btn.hidden = false;
-          continue;
-        }
-        btn.hidden = !(d.scrollHeight > d.clientHeight + 2);
-      }
-    });
-  }
-
-  function convFromCard(s) {
-    return normConv({
-      id: s.conversation_id,
-      staff_id: s.id,
-      peer: {
-        name: s.full_name,
-        subtitle: s.role_label + (s.position ? ' · ' + s.position : ''),
-        photo_url: s.photo_url,
-        is_online: s.is_online,
-        initials: initialsOf(s.full_name),
-      },
-      unread: s.unread,
-    });
-  }
-
-  function openClientChat(conv, card) {
-    if (nav.locked()) return;
-    const staffId = conv ? conv.staff_id : card.id;
-    const known = conv || S.convs.find((c) => c.staff_id === staffId) || null;
-    const pre = known || convFromCard(card);
-    nav.push(
-      ChatScreen({
-        conv: pre,
-        unread: known ? known.unread : card ? card.unread : 0,
-        load: async () => {
-          if (known && known.id && !known.available && !card) {
-            // Xodim endi mavjud emas — faqat tarixni ko'rsatamiz
-            const r0 = await api('messages', { conversationId: known.id });
-            return { conversation: known, messages: r0.messages, has_more: r0.has_more, readonly: true, server_time: r0.server_time };
-          }
-          try {
-            // Kartadagi «✍️ Yozish» — aniq tanlov: bot chatidagi xabarlar ham endi shu xodimga boradi.
-            // Suhbatlar ro'yxatidan eski suhbatni shunchaki ochish yo'nalishni o'zgartirmaydi (birinchi yozilganda o'zgaradi).
-            const r = await api('conversation.open', card ? { staffId: staffId, activate: true } : { staffId: staffId });
-            return {
-              conversation: r.conversation,
-              messages: r.messages,
-              has_more: r.has_more,
-              active_conversation_id: r.active_conversation_id,
-              server_time: r.server_time,
-            };
-          } catch (e) {
-            const convId = known && known.id ? known.id : card && card.conversation_id ? card.conversation_id : null;
-            if ((e.code === 'staff_unavailable' || e.status === 404) && convId) {
-              const r2 = await api('messages', { conversationId: convId });
-              return { conversation: known || pre, messages: r2.messages, has_more: r2.has_more, readonly: true, server_time: r2.server_time };
-            }
-            throw e;
-          }
-        },
-      }),
-    );
   }
 
   // ═══════════════════════════ Chat ekrani (mijoz va xodim uchun umumiy) ═══════════════════════════
@@ -3722,6 +3617,91 @@
     };
   }
 
+  /**
+   * "Mijoz havolasi" maydoni: o'zgarmas prefiks (t.me/<mijoz_boti>?start=) + havola nomi. Kiritilgan matn
+   * darhol kichik harfga o'giriladi; tekshiruv server bilan bir xil (LINK_CODE_RE).
+   */
+  function linkCodeField(o) {
+    const id = 'f' + Math.random().toString(36).slice(2, 9);
+    const input = h('input', {
+      class: 'input',
+      id: id,
+      type: 'text',
+      placeholder: o.placeholder || '',
+      autocomplete: 'off',
+      autocapitalize: 'none',
+      autocorrect: 'off',
+      spellcheck: 'false',
+      enterkeyhint: 'done',
+      'aria-describedby': id + '-hint',
+    });
+    const prefixText = h('span', { dir: 'ltr' });
+    const prefixEl = h('span', { class: 'link-prefix', 'aria-hidden': 'true' }, prefixText);
+    const box = h('div', { class: 'link-input' }, [prefixEl, input]);
+    const hintEl = h('div', { class: 'field-hint', id: id + '-hint' });
+    const errEl = h('div', { class: 'field-error', hidden: true, role: 'alert' });
+    const el = h('div', { class: 'field' }, [
+      h('label', { class: 'field-label', for: id }, h('span', null, o.label)),
+      box,
+      hintEl,
+      errEl,
+    ]);
+    function setPrefix(bot) {
+      prefixText.textContent = (bot ? 't.me/' + bot : '') + '?start=';
+    }
+    function setError(msg) {
+      errEl.textContent = msg || '';
+      errEl.hidden = !msg;
+      box.classList.toggle('invalid', !!msg);
+      if (msg) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+    }
+    input.addEventListener('input', () => {
+      // Katta harflar darhol kichikka (uzunlik o'zgarmaydi — kursor joyida qoladi)
+      const v = input.value;
+      const lower = v.toLowerCase();
+      if (lower !== v && lower.length === v.length) {
+        const a = input.selectionStart;
+        const b = input.selectionEnd;
+        input.value = lower;
+        try {
+          input.setSelectionRange(a, b);
+        } catch (e) {
+          /* e'tiborsiz */
+        }
+      }
+      if (!errEl.hidden) setError('');
+      if (o.onInput) o.onInput();
+    });
+    setPrefix(o.bot);
+    return {
+      el: el,
+      input: input,
+      get: () => normalizeLinkCode(input.value),
+      set: (v) => {
+        input.value = v == null ? '' : String(v);
+      },
+      setPrefix: setPrefix,
+      setHint: (children) => {
+        clear(hintEl);
+        append(hintEl, children);
+        hintEl.hidden = !hintEl.firstChild;
+      },
+      setPlaceholder: (v) => {
+        input.placeholder = v || '';
+      },
+      setError: setError,
+      focus: () => {
+        try {
+          input.focus({ preventScroll: true });
+        } catch (e) {
+          /* e'tiborsiz */
+        }
+        revealV(el, true);
+      },
+    };
+  }
+
   function segmented(options, value, onChange) {
     let current = value;
     const btns = options.map((opt) =>
@@ -4015,6 +3995,18 @@
             ]),
             h('span', { class: 'switch' }, [sw.input, h('span', { class: 'track', 'aria-hidden': 'true' })]),
           ]),
+          h('div', { class: 'link-card' }, [
+            h('div', { class: 'link-card-title', text: '🔗 Mijozlar uchun havolangiz' }),
+            h('div', {
+              class: 'link-card-sub',
+              text: m.is_active
+                ? 'Shu havolani mijozlaringizga bering — ular kirishi bilan siz bilan chat boshlanadi.'
+                : "⛔ Profilingiz o'chirib qo'yilgan — havola faollashtirilgach ishlaydi.",
+            }),
+            m.client_link
+              ? clientLinkBox(m.client_link, LINK_SHARE_TEXT)
+              : h('div', { class: 'link-card-empty', text: "Havola hozircha tayyor emas. Admin bilan bog'laning." }),
+          ]),
           h('div', { class: 'info-block' }, [
             h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Tavsif' }), h('div', { class: 'info-value' + (m.description ? '' : ' muted'), text: m.description || "Kiritilmagan" })]),
             m.greeting !== undefined
@@ -4126,6 +4118,7 @@
     const res = await api('admin.staff.list');
     const list = Array.isArray(res.staff) ? res.staff : Array.isArray(res.items) ? res.items : Array.isArray(res.list) ? res.list : [];
     A.staff = list.map(normAdminStaff).filter((s) => s.id);
+    if (typeof res.client_bot === 'string' && /^[A-Za-z0-9_]{3,64}$/.test(res.client_bot)) S.clientBot = res.client_bot;
     A.loaded = true;
     bus.emit('admin');
     return A.staff;
@@ -4188,7 +4181,7 @@
     function staffRow(s) {
       const status = s.linked ? (s.is_active ? '🟢 Faol' : "⛔ O'chirilgan") : '⏳ Ulanmagan' + (s.is_active ? '' : " · o'chirilgan");
       const blocked = s.linked && s.bot_blocked ? " · ⚠️ botni to'xtatgan" : '';
-      const sub = status + blocked + (s.position ? ' · ' + s.position : '');
+      const sub = status + blocked + (s.position ? ' · ' + s.position : '') + (s.link_code ? ' · 🔗 ' + s.link_code : '');
       return h('button', { class: 'row', type: 'button', onclick: () => openStaffForm(s.id) }, [
         avatar({ url: s.photo_url, name: s.full_name, seed: s.id, size: 48, online: s.linked && s.is_active ? s.is_online : null, lazy: true }),
         h('div', { class: 'row-main' }, [
@@ -4347,6 +4340,14 @@
     });
     const fSort = makeField({ label: 'Tartib raqami', type: 'number', inputmode: 'numeric', placeholder: '0', hint: "Kichik raqamli xodim ro'yxatda yuqoriroq turadi.", onInput: () => updateDirty() });
     const activeSw = switchRow('Faol', "O'chirilgan xodim mijozlarga ko'rinmaydi va unga yozib bo'lmaydi.", cur ? cur.is_active : true, () => updateDirty());
+    const fLink = linkCodeField({
+      label: 'Havola nomi',
+      bot: clientBotName(cur && cur.client_link),
+      onInput: () => {
+        updateDirty();
+        renderClientLink();
+      },
+    });
 
     if (cur) {
       fName.set(cur.full_name);
@@ -4354,10 +4355,20 @@
       fDesc.set(cur.description);
       fGreet.set(cur.greeting || '');
       fSort.set(String(cur.sort_order));
+      fLink.set(cur.link_code || '');
     }
 
     function snapshot() {
-      return JSON.stringify([roleSeg.get(), fName.get().trim(), fPos.get().trim(), fDesc.get().trim(), fGreet.get().trim(), isNew ? true : activeSw.get(), isNew ? '' : fSort.get().trim()]);
+      return JSON.stringify([
+        roleSeg.get(),
+        fName.get().trim(),
+        fPos.get().trim(),
+        fDesc.get().trim(),
+        fGreet.get().trim(),
+        isNew ? true : activeSw.get(),
+        isNew ? '' : fSort.get().trim(),
+        fLink.get(),
+      ]);
     }
     let baseline = snapshot();
     function isDirty() {
@@ -4464,9 +4475,51 @@
       if (s && !destroyed) {
         cur = s;
         renderAccount();
+        renderClientLink();
       }
       if (S.me && cur && S.me.id === cur.id) refreshMe();
       return s;
+    }
+
+    // ── Mijoz havolasi (xodimning shaxsiy qisqa havolasi) ──
+    const clientLinkWrap = h('div');
+    const clientLinkSec = h('div', { class: 'form-sec' }, [fLink.el, clientLinkWrap]);
+
+    function renderClientLink() {
+      if (destroyed) return;
+      const saved = cur ? cur.link_code || '' : '';
+      const code = fLink.get();
+      const bot = clientBotName(cur && cur.client_link);
+      fLink.setPrefix(bot);
+      const hint = [];
+      if (isNew) {
+        const suggestion = linkCodeSuggestion(fName.get());
+        fLink.setPlaceholder(suggestion);
+        hint.push("Bo'sh qoldirilsa — ismdan avtomatik yaratiladi (masalan: ");
+        hint.push(h('code', { text: suggestion }));
+        hint.push('). ');
+      } else {
+        fLink.setPlaceholder(saved || 'aziza');
+      }
+      hint.push("2–32 ta lotin harfi, raqam yoki _. Mijoz shu havola orqali botga kirsa, hech narsa tanlamasdan shu xodim bilan chat boshlanadi.");
+      if (!isNew && code && code !== saved && !linkCodeError(code) && bot) {
+        hint.push(' Saqlangandan keyin: ');
+        hint.push(h('code', { text: 't.me/' + bot + '?start=' + code }));
+      }
+      fLink.setHint(hint);
+
+      clear(clientLinkWrap);
+      if (isNew || !cur) return;
+      const link = safeClientLink(cur.client_link);
+      const notes = [];
+      if (!cur.linked) notes.push('⏳ Havola xodim akkaunti ulangandan keyin ishlaydi.');
+      else if (!cur.is_active) notes.push("⛔ Xodim o'chirib qo'yilgan — havola hozir ishlamaydi.");
+      append(clientLinkWrap, [
+        link
+          ? clientLinkBox(link, LINK_SHARE_TEXT)
+          : h('div', { class: 'field-hint', style: 'padding-bottom:14px', text: "Bot username aniqlanmadi — «npm run setup» ni qayta ishga tushiring." }),
+        notes.length ? h('div', { class: 'field-hint client-link-note', text: notes.join(' ') }) : null,
+      ]);
     }
 
     // ── Akkaunt (taklif havolasi) bo'limi ──
@@ -4615,6 +4668,12 @@
           if (!firstBad) firstBad = fSort;
         } else fSort.setError('');
       }
+      // Havola nomi: yangi xodimda ixtiyoriy; mavjud xodimda faqat o'zgartirilgan bo'lsa tekshiriladi
+      const code = fLink.get();
+      const linkChanged = isNew ? !!code : code !== ((cur && cur.link_code) || '');
+      const linkErr = linkChanged ? linkCodeError(code) : '';
+      fLink.setError(linkErr);
+      if (linkErr && !firstBad) firstBad = fLink;
       if (firstBad) {
         firstBad.focus();
         haptic.notify('error');
@@ -4633,12 +4692,15 @@
         description: fDesc.get().trim(),
         greeting: fGreet.get().trim() || null,
       };
+      const linkCode = fLink.get();
       saving = true;
       saveBtn.classList.add('loading');
       saveBtn.disabled = true;
       try {
         if (isNew) {
-          const res = await api('admin.staff.create', values);
+          const res = await api('admin.staff.create', linkCode ? Object.assign({ link_code: linkCode }, values) : values);
+          // Havola nomi band/noto'g'ri bo'lsa ham xodim yaratiladi — avtomatik nom qoladi, server ogohlantiradi
+          if (res && typeof res.warning === 'string' && res.warning) toast(res.warning, 'warn', 7000);
           let created = adminStaffFrom(res);
           if (!created) {
             await loadAdminStaff();
@@ -4682,6 +4744,7 @@
         const sv = fSort.get().trim();
         const sortVal = sv === '' ? 0 : parseInt(sv, 10);
         if (sortVal !== cur.sort_order) patch.sort_order = sortVal;
+        if (linkCode !== (cur.link_code || '')) patch.link_code = linkCode;
         if (!Object.keys(patch).length) {
           baseline = snapshot();
           updateDirty();
@@ -4689,11 +4752,18 @@
         }
         const res = await api('admin.staff.update', { id: cur.id, patch: patch });
         await applyStaffResult(res);
+        if (!destroyed && cur && cur.link_code) fLink.set(cur.link_code);
         baseline = snapshot();
+        renderClientLink();
         toast('✅ Saqlandi', 'success');
         haptic.notify('success');
       } catch (e) {
-        reportError(e);
+        if (!destroyed && (e.code === 'link_invalid' || e.code === 'link_taken')) {
+          // Havola nomi xatosi — maydon ostida (boshqa maydonlar ham saqlanmagan, forma qayta yuboriladi)
+          fLink.setError(e.message || linkCodeError(linkCode));
+          fLink.focus();
+          haptic.notify('error');
+        } else reportError(e);
       } finally {
         saving = false;
         saveBtn.classList.remove('loading');
@@ -4725,6 +4795,8 @@
         fDesc.el,
       ]),
     );
+    parts.push(h('div', { class: 'form-sec-title', text: 'Mijoz havolasi' }));
+    parts.push(clientLinkSec);
     parts.push(h('div', { class: 'form-sec-title', text: 'Avto-javob' }));
     parts.push(h('div', { class: 'form-sec' }, fGreet.el));
     if (!isNew) {
@@ -4748,6 +4820,7 @@
     } else {
       renderPhoto();
       renderAccount();
+      renderClientLink();
       updateDirty();
       if (flags.justCreated) {
         setTimeout(() => {
@@ -4757,6 +4830,7 @@
     }
     fName.input.addEventListener('input', () => {
       if (isNew && !newPhoto) renderPhoto();
+      if (isNew) renderClientLink();
     });
 
     self.canLeave = async () => {
@@ -4956,15 +5030,6 @@
     );
   }
 
-  function handleStartParam() {
-    if (S.role !== 'client') return;
-    const sp = tg && tg.initDataUnsafe ? str(tg.initDataUnsafe.start_param) : '';
-    const m = /^staff_(\d+)$/.exec(sp);
-    if (!m) return;
-    const s = S.staff.find((x) => x.id === Number(m[1]));
-    if (s) setTimeout(() => openClientChat(null, s), 50);
-  }
-
   async function boot() {
     if (!initData) {
       clear(appEl);
@@ -4973,19 +5038,28 @@
     }
     try {
       const res = await api('bootstrap', {}, { timeout: 25000 });
+      if (res.role !== 'staff') {
+        // Mijozlar uchun Mini App yo'q (server odatda 403 client_app_disabled qaytaradi; bu — qo'shimcha himoya)
+        clear(appEl);
+        clientAppDisabled();
+        return;
+      }
       applyBootstrap(res);
-      if (S.role === 'staff' && !S.me && !S.isAdmin) {
+      if (!S.me && !S.isAdmin) {
         accessRevoked();
         return;
       }
       outboxRestore();
-      nav.setRoot(S.role === 'client' ? ClientRoot() : StaffRoot());
+      nav.setRoot(StaffRoot());
       poller.lastBoot = 0;
       poller.plan(LIST_POLL);
-      handleStartParam();
     } catch (e) {
       clear(appEl);
-      if (e.status === 401 || sessionDead || accessDead) return;
+      if (e.status === 401 || sessionDead || accessDead || clientDisabled) return;
+      if (e.code === 'client_app_disabled') {
+        clientAppDisabled(e.message);
+        return;
+      }
       if (e.code === 'not_staff' || e.status === 403) {
         // handleResponse 'not_staff' da allaqachon chaqiradi; boshqa 403 lar uchun — xabar matni bilan
         accessRevoked(e.code === 'not_staff' ? MSG.notStaff : e.message);

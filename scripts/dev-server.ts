@@ -422,7 +422,8 @@ async function printDevLinks(cli: Cli, base: string): Promise<void> {
     const make = (token: string, id: number) =>
       `${base}/app/#dev_init_data=${encodeURIComponent(buildInitData(token, { id, first_name: 'Dev', username: 'dev_user' }))}`;
     console.log('\n🔗 Mini App dev havolalari (24 soat amal qiladi, faqat shu kompyuterda ishlating — hech kimga bermang):');
-    console.log(`   👤 Mijoz (ID ${clientUser}):\n   ${make(config.clientBotToken, clientUser)}`);
+    // Mijozlar uchun Mini App o'chirilgan: bu havola faqat «Bot chatida yozing» ekranini tekshirish uchun
+    console.log(`   👤 Mijoz (ID ${clientUser}) — «Bot chatida yozing» ekrani:\n   ${make(config.clientBotToken, clientUser)}`);
     if (config.hasStaffBot) {
       const staffUser = cli.user ?? admins[0]!;
       console.log(`   🧑‍💼 Xodim/admin (ID ${staffUser}):\n   ${make(config.staffBotToken, staffUser)}`);

@@ -1,4 +1,6 @@
-// Mijozlar boti (@uzgroww_bot): operator/menejer tanlash, ular bilan bot orqali yozishish, suhbatlar tarixi.
+// Mijozlar boti (@uzgroww_bot): juda sodda — mijoz xodimning shaxsiy havolasi (t.me/<bot>?start=<nom>) orqali
+// kirsa, hech narsa tanlamasdan o'sha xodim bilan chat boshlanadi; oddiy /start da operator/menejer tanlanadi.
+// Mini App (web_app) tugmalari va doimiy pastki klaviatura yo'q.
 import { Bot, InputMediaBuilder, type Context } from 'grammy';
 import type {
   ForceReply,
@@ -9,18 +11,20 @@ import type {
   ReplyParameters,
 } from 'grammy/types';
 import { config } from '../config.js';
-import { getWebAppUrl } from '../links.js';
 import { relayErrorText } from '../relay.js';
 import {
+  clearLegacyKeyboard,
   findConversationByClientReply,
   getConversation,
   getOrCreateConversation,
   getStaff,
+  getStaffByLinkCode,
   isStaffAvailable,
   listAvailableStaff,
   listClientConversations,
   listMessages,
   markReadByClient,
+  normalizeLinkCode,
   setClientActiveConversation,
   setClientBlocked,
   upsertClient,
@@ -29,10 +33,11 @@ import { welcomeText } from '../texts.js';
 import { extractContent, retryOnFlood } from '../tg.js';
 import type { Client, Conversation, Role, Staff } from '../types.js';
 import { hitRateLimit, type RateRule } from '../webapp/guards.js';
-import { dativeSuffix, esc, isNotModified, roleLabel, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
+import { dativeSuffix, esc, isNotModified, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
 import { withStaffPhoto } from './client/photo.js';
 import {
   clearSelection,
+  conversationFromNamedStaff,
   conversationStaff,
   heldItemFrom,
   holdMessages,
@@ -49,16 +54,19 @@ import {
 import {
   BTN,
   HISTORY_PAGE_SIZE,
+  REMOVE_KEYBOARD,
   T,
   activeChosenText,
+  activeStartText,
   activeChosenToast,
   cardMarkup,
   cb,
   heldSentLine,
   helpText,
-  mainKeyboard,
+  linkWelcomeCaption,
   markup,
   neighbour,
+  pickedText,
   redirectedNote,
   renderChats,
   renderChoose,
@@ -71,7 +79,6 @@ import {
   switchedNote,
   tooFastText,
   undeliveredNote,
-  webAppBtn,
   writeToButton,
   type Rows,
 } from './client/ui.js';
@@ -171,30 +178,63 @@ function botErrorReporter(ctx: Context): ErrorReporter {
   };
 }
 
-// ───────────────────────────── Ekranlar ─────────────────────────────
-
-/** Asosiy menyu xabari (inline): Mini App + rollar. */
-async function sendMenu(ctx: Context, variant: 'start' | 'menu', note?: string): Promise<void> {
-  const url = await getWebAppUrl();
-  let text: string;
-  if (variant === 'menu') text = T.menu;
-  else text = url ? T.startMenuWithApp : T.startMenuNoApp;
-  if (note) text = `${note}\n\n${text}`;
-  const rows: Rows = [];
-  if (url) rows.push([webAppBtn('📱 Menyuni ochish', url)]);
-  rows.push(roleRow());
-  if (variant === 'menu') rows.push([cb(BTN.chats, 'chats')]);
-  await sendHtml(ctx, text, markup(rows));
+/**
+ * Eski mijozlarda v1 dagi doimiy pastki menyu (👨‍💻 Operatorlar / 👔 Menejerlar / 💬 Suhbatlarim / ℹ️ Yordam) qolgan.
+ * U faqat `remove_keyboard` li xabar bilan yo'qoladi, inline tugmalar bilan esa bitta xabarda yuborib bo'lmaydi.
+ * silent — joriy javobning o'zi `remove_keyboard` bilan yuborildi (faqat belgi olib tashlanadi); aks holda bir
+ * martalik qisqa izoh yuboriladi (keyin — odatdagi javob). Yangi mijozlarda belgi yo'q — hech narsa qilinmaydi.
+ */
+async function dropLegacyKeyboard(ctx: Context, silent: boolean): Promise<void> {
+  const client = clientOf(ctx);
+  if (!client.legacy_keyboard) return;
+  client.legacy_keyboard = false;
+  const claimed = await clearLegacyKeyboard(client.tg_user_id).catch((e: unknown) => {
+    console.warn('[client] clearLegacyKeyboard:', e);
+    return false;
+  });
+  if (claimed && !silent) await sendHtml(ctx, T.legacyKeyboardRemoved, REMOVE_KEYBOARD);
 }
 
+// ───────────────────────────── Ekranlar ─────────────────────────────
+
+/**
+ * Oddiy /start (va /menu): BITTA xabar + [👨‍💻 Operatorlar] [👔 Menejerlar].
+ * Mavjud xodim bilan faol suhbat bo'lsa — "Siz … bilan suhbatdasiz", aks holda salomlashuv matni.
+ * note — oldidan qo'shiladigan izoh (masalan, havola bo'yicha xodim topilmadi).
+ */
+async function sendStart(ctx: Context, note?: string): Promise<void> {
+  await dropLegacyKeyboard(ctx, false);
+  const client = clientOf(ctx);
+  let text: string | null = null;
+  if (client.active_conversation_id != null) {
+    const staff = await conversationStaff(client.active_conversation_id, client.tg_user_id);
+    if (isStaffAvailable(staff)) text = activeStartText(staffName(staff));
+  }
+  if (text == null) text = esc(await welcomeText(client));
+  if (note) text = `${note}\n\n${text}`;
+  await sendHtml(ctx, text, markup([roleRow()]));
+}
+
+/** /help — qisqa matn; eski doimiy klaviatura (bo'lsa) olib tashlanadi. */
 async function sendHelp(ctx: Context): Promise<void> {
-  const url = await getWebAppUrl();
-  await sendHtml(ctx, helpText(!!url), mainKeyboard());
+  await sendHtml(ctx, helpText(), REMOVE_KEYBOARD);
+  await dropLegacyKeyboard(ctx, true);
+}
+
+/** Endi ko'rsatilmaydigan eski buyruq yoki eski pastki menyu tugmasi: eski menyu (bo'lsa) olib tashlanadi. */
+async function legacyStaffList(ctx: Context, role: Role): Promise<void> {
+  await dropLegacyKeyboard(ctx, false);
+  await showStaffList(ctx, role, 0, 'send');
+}
+
+async function legacyChats(ctx: Context): Promise<void> {
+  await dropLegacyKeyboard(ctx, false);
+  await showChats(ctx, 0, 'send');
 }
 
 async function showStaffList(ctx: Context, role: Role, page: number, mode: 'send' | 'edit'): Promise<void> {
-  const [staff, url] = await Promise.all([listAvailableStaff(role), getWebAppUrl()]);
-  const view = renderStaffList(role, staff, page, url);
+  const staff = await listAvailableStaff(role);
+  const view = renderStaffList(role, staff, page);
   if (mode === 'edit') await editOrSend(ctx, view.text, view.markup);
   else await sendHtml(ctx, view.text, view.markup);
 }
@@ -220,10 +260,9 @@ async function sendStaffCard(ctx: Context, staff: Staff): Promise<void> {
 
 async function showChats(ctx: Context, page: number, mode: 'send' | 'edit'): Promise<void> {
   const client = clientOf(ctx);
-  const [convs, available, url] = await Promise.all([
+  const [convs, available] = await Promise.all([
     listClientConversations(client.tg_user_id, 200),
     listAvailableStaff(),
-    getWebAppUrl(),
   ]);
   const availableIds = new Set(available.map((s) => s.id));
   // Faol suhbatning xodimi mavjud emas (o'chirib qo'yilgan/uzilgan): "faol" deb ko'rsatmaymiz va tozalaymiz
@@ -234,7 +273,7 @@ async function showChats(ctx: Context, page: number, mode: 'send' | 'edit'): Pro
     client.active_conversation_id = null;
   }
   const visible = convs.filter((c) => c.last_message_at != null || c.id === client.active_conversation_id);
-  const view = renderChats(visible, client.active_conversation_id, availableIds, page, url);
+  const view = renderChats(visible, client.active_conversation_id, availableIds, page);
   if (mode === 'edit') await editOrSend(ctx, view.text, view.markup);
   else await sendHtml(ctx, view.text, view.markup);
 }
@@ -325,37 +364,62 @@ async function pickStaff(ctx: Context, staff: Staff): Promise<void> {
     await onStaffUnavailable(ctx, client, conv, out.rest);
     return;
   }
-  const heldSent = out?.sent ?? 0;
+  const existing = conv.last_message_at != null;
+  if (existing) await markReadByClient(conv.id);
+  // Eski doimiy klaviatura (bo'lsa) shu xabar bilan olib tashlanadi — shuning uchun inline tugma yo'q
+  const text = pickedText({ staff, existing, heldSent: out?.sent ?? 0, undelivered: !!out?.undelivered });
+  await sendHtml(ctx, text, REMOVE_KEYBOARD);
+  await dropLegacyKeyboard(ctx, true);
+}
 
-  const name = staffName(staff);
-  const who = `<b>${esc(name)}</b> (${roleLabel(staff.role)})`;
-  let text: string;
-  const rows: Rows = [];
-  if (conv.last_message_at) {
-    await markReadByClient(conv.id);
-    text = `✅ Siz yana ${who} bilan bog'landingiz — suhbatingiz davom etadi.`;
-    rows.push([cb('📜 Suhbat tarixi', `hist:${conv.id}:0`)]);
-  } else {
-    text = `✅ Siz endi ${who} bilan bog'landingiz.`;
+/**
+ * Xodimning shaxsiy havolasi (/start <nom> yoki /start staff_<id>) orqali kirish: hech narsa tanlatmasdan shu xodim
+ * bilan suhbat faol qilinadi, tanlovgacha saqlangan xabarlar unga yuboriladi va BITTA xabar — xodim rasmi +
+ * "Siz … bilan bog'landingiz" izohi (tugmasiz; eski doimiy klaviatura olib tashlanadi).
+ */
+async function startWithStaff(ctx: Context, staff: Staff): Promise<void> {
+  const client = clientOf(ctx);
+  const conv = await getOrCreateConversation(client.tg_user_id, staff.id);
+  const existing = conv.last_message_at != null;
+  await setClientActiveConversation(client.tg_user_id, conv.id);
+  client.active_conversation_id = conv.id;
+
+  // Xodim tanlanmaguncha yozilgan xabarlar — endi shu xodimga (avto-javob relay ichida, bir marta).
+  // takeHeld shu suhbatni "botda aniq tanlangan" deb belgilaydi (keyingi xabarda "boshqa xodimga ketdi" izohi chiqmaydi).
+  const out = await deliverHeldOnSelect(ctx, client, conv);
+  if (out?.unavailable) {
+    await onStaffUnavailable(ctx, client, conv, out.rest);
+    return;
   }
-  if (heldSent > 0) {
-    text += `\n\n${heldSentLine(heldSent, name)} Javob shu chatga keladi.`;
-  } else if (conv.last_message_at) {
-    text += "\n\n✍️ Xabaringizni yozing — u to'g'ridan-to'g'ri unga yetkaziladi.";
-  } else {
-    text +=
-      "\n\n✍️ Savolingizni yozing — xabaringiz to'g'ridan-to'g'ri unga yetkaziladi. " +
-      'Matn, rasm, video, fayl, ovozli xabar yuborishingiz mumkin.';
+  if (existing) await markReadByClient(conv.id);
+
+  const caption = linkWelcomeCaption({
+    clientName: client.first_name,
+    staff,
+    existing,
+    heldSent: out?.sent ?? 0,
+    undelivered: !!out?.undelivered,
+  });
+  try {
+    await withStaffPhoto(
+      staff,
+      (media) => ctx.replyWithPhoto(media, { caption, parse_mode: 'HTML', reply_markup: REMOVE_KEYBOARD }),
+      () => showUploadAction(ctx),
+    );
+  } catch (e) {
+    if (tgErrorCode(e) === 403) throw e;
+    console.error(`[client] xodim #${staff.id} rasmini yuborib bo'lmadi, matn yuboriladi:`, tgErrorDescription(e));
+    await sendHtml(ctx, caption, REMOVE_KEYBOARD);
   }
-  // Birinchi xabar yuborilgan bo'lsa, oflayn izohi avto-javobning o'zida bor
-  if (!staff.is_online && !(heldSent > 0 && !conv.last_message_at)) {
-    text += "\n\n⚪️ <i>Hozir oflayn — xabaringiz saqlanadi va imkon qadar tezroq javob beriladi.</i>";
-  }
-  if (out?.undelivered) {
-    text += `\n\n${undeliveredNote(name)}`;
-    rows.push(roleRow());
-  }
-  await sendHtml(ctx, text, rows.length ? markup(rows) : undefined);
+  await dropLegacyKeyboard(ctx, true);
+}
+
+/** /start payload: `staff_<id>` (eski havolalar) yoki xodimning havola nomi (katta-kichik harf farqsiz). */
+async function staffFromStartPayload(payload: string): Promise<Staff | null> {
+  const code = normalizeLinkCode(payload);
+  const legacy = /^staff_(\d{1,15})$/.exec(code);
+  if (legacy) return getStaff(Number(legacy[1]));
+  return getStaffByLinkCode(code);
 }
 
 // ───────────────────────────── Xabarlarni yo'naltirish ─────────────────────────────
@@ -409,9 +473,22 @@ async function conversationFromBotMessage(client: Client, replyTo: TgMessage, bo
 }
 
 /**
+ * Tugmasiz bot xabari (havola orqali ulanish xabari, «✍️ Yozish» tasdig'i, /start dagi "Siz … bilan suhbatdasiz"):
+ * undagi qalin xodim ismi bo'yicha shu mijozning suhbati — faqat xodim hozir mavjud bo'lsa (aks holda taxmin yo'q).
+ */
+async function conversationFromNamedMessage(client: Client, replyTo: TgMessage, botId: number): Promise<Conversation | null> {
+  const convId = await conversationFromNamedStaff(client.tg_user_id, replyTo, botId);
+  if (convId == null) return null;
+  const conv = await getConversation(convId);
+  if (!conv || conv.client_id !== client.tg_user_id) return null;
+  return isStaffAvailable(await getStaff(conv.staff_id)) ? conv : null;
+}
+
+/**
  * Xabar qaysi suhbatga:
  *  1) Reply qilingan xabar (xodim xabari, uning sarlavhasi/bo'laklari, mijozning o'z xabari, avto-javob);
  *  2) Reply qilingan bot xabarining tugmalari (transkript, xodim kartasi, «↩️ … ga yozish» bildirishnomasi);
+ *  2b) tugmasiz bot xabari (havola orqali ulanish, «✍️ Yozish» tasdig'i) — undagi qalin xodim ismi bo'yicha;
  *  3) bot xabariga Reply, lekin aniqlab bo'lmadi — faol suhbatga YUBORILMAYDI (unresolvedReply);
  *  4) Reply'siz (yoki mijozning o'z bog'lanmagan xabariga Reply) — faol suhbat.
  */
@@ -423,6 +500,8 @@ async function resolveConversation(client: Client, msg: TgMessage, botId: number
     if (replyTo.from?.id === botId) {
       const byButtons = await conversationFromBotMessage(client, replyTo, botId);
       if (byButtons) return { conv: byButtons, viaReply: true, unresolvedReply: false };
+      const byName = await conversationFromNamedMessage(client, replyTo, botId);
+      if (byName) return { conv: byName, viaReply: true, unresolvedReply: false };
       return { conv: null, viaReply: false, unresolvedReply: true };
     }
   }
@@ -672,34 +751,32 @@ function createClientBot(): Bot {
   });
 
   // ── Buyruqlar ──
+  // /start <nom> — xodimning shaxsiy havolasi: darhol shu xodim bilan chat. Oddiy /start — bitta xabar + tanlash.
   bot.command('start', async (ctx) => {
-    const client = clientOf(ctx);
     const payload = (typeof ctx.match === 'string' ? ctx.match : '').trim();
-    await sendHtml(ctx, esc(await welcomeText(client)), mainKeyboard());
-
-    const deep = /^staff_(\d{1,15})$/.exec(payload);
-    if (deep) {
-      const staff = await getStaff(Number(deep[1]));
-      if (isStaffAvailable(staff)) {
-        await sendStaffCard(ctx, staff);
-        return;
-      }
-      await sendMenu(ctx, 'start', T.deepLinkMissing);
+    if (!payload) {
+      await sendStart(ctx);
       return;
     }
-    await sendMenu(ctx, 'start');
+    const staff = await staffFromStartPayload(payload);
+    if (isStaffAvailable(staff)) {
+      await startWithStaff(ctx, staff);
+      return;
+    }
+    await sendStart(ctx, T.linkNotFound);
   });
 
-  bot.command('menu', (ctx) => sendMenu(ctx, 'menu'));
-  bot.command('operators', (ctx) => showStaffList(ctx, 'operator', 0, 'send'));
-  bot.command('managers', (ctx) => showStaffList(ctx, 'manager', 0, 'send'));
-  bot.command('chats', (ctx) => showChats(ctx, 0, 'send'));
+  bot.command('menu', (ctx) => sendStart(ctx));
   bot.command('help', (ctx) => sendHelp(ctx));
+  // Endi ko'rsatilmaydigan (eski) buyruqlar — ishlashda davom etadi
+  bot.command('operators', (ctx) => legacyStaffList(ctx, 'operator'));
+  bot.command('managers', (ctx) => legacyStaffList(ctx, 'manager'));
+  bot.command('chats', (ctx) => legacyChats(ctx));
 
-  // ── Pastki klaviatura ──
-  bot.hears(BTN.operators, (ctx) => showStaffList(ctx, 'operator', 0, 'send'));
-  bot.hears(BTN.managers, (ctx) => showStaffList(ctx, 'manager', 0, 'send'));
-  bot.hears(BTN.chats, (ctx) => showChats(ctx, 0, 'send'));
+  // ── Eski doimiy klaviatura yorliqlari (endi yuborilmaydi; bosilsa ishlaydi va eski menyu olib tashlanadi) ──
+  bot.hears(BTN.operators, (ctx) => legacyStaffList(ctx, 'operator'));
+  bot.hears(BTN.managers, (ctx) => legacyStaffList(ctx, 'manager'));
+  bot.hears(BTN.chats, (ctx) => legacyChats(ctx));
   bot.hears(BTN.help, (ctx) => sendHelp(ctx));
 
   // ── Inline tugmalar ──

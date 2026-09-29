@@ -1,6 +1,7 @@
 // Xodimlar boti uchun umumiy: kontekst turi, doimiy klaviatura, HTML yuborish va "joyida tahrirlash" yordamchilari.
 import { InlineKeyboard, Keyboard, type Context } from 'grammy';
 import type { Message as TgMessage, ReplyKeyboardRemove } from 'grammy/types';
+import { staffClientLink } from '../../links.js';
 import type { Staff } from '../../types.js';
 import { describeError, isNotModified, tgErrorDescription } from '../../util.js';
 
@@ -174,6 +175,33 @@ export function parseId(s: string | undefined): number | null {
   if (!s || !/^\d{1,15}$/.test(s)) return null;
   const n = Number(s);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+// ───────────────────────────── Mijozlar uchun shaxsiy havola ─────────────────────────────
+
+/** Mijozlar havolasini ulashishda (t.me/share) qo'shiladigan matn. */
+export const CLIENT_LINK_SHARE_TEXT = "Men bilan shu havola orqali bog'laning";
+
+/** Mijozlar havolasi nima qilishi — bir qatorda (taklif havolasi muvaffaqiyati, profil, yordam). */
+export const CLIENT_LINK_HINT = 'Shu havolani mijozlaringizga bering — ular kirishi bilan siz bilan chat boshlanadi.';
+
+/** Telegram "ulashish" havolasi: https://t.me/share/url?url=<havola>&text=<matn> */
+export function shareUrl(link: string, text: string = CLIENT_LINK_SHARE_TEXT): string {
+  return `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
+}
+
+/**
+ * Xodimning mijozlar uchun havolasi (https://t.me/<mijoz_boti>?start=<link_code>). Mijozlar boti nomini aniqlab
+ * bo'lmasa (tarmoq xatosi yoki bot sozlanmagan) — '' (hech qachon xato tashlamaydi: karta/profil baribir ko'rsatiladi).
+ */
+export async function clientLinkOf(s: Pick<Staff, 'id' | 'link_code'>): Promise<string> {
+  try {
+    const link = await staffClientLink(s);
+    return link.startsWith('https://') ? link : '';
+  } catch (e) {
+    console.warn('[staff] mijozlar havolasini aniqlab bo\'lmadi:', tgErrorDescription(e));
+    return '';
+  }
 }
 
 /** Butun sonni 1 234 567 ko'rinishida. */

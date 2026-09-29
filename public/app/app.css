@@ -1759,6 +1759,102 @@ html[data-scheme='dark'] .invite-link {
   grid-column: 1 / -1;
 }
 
+/* ─────────────── Mijozlar uchun shaxsiy havola ─────────────── */
+
+.link-input {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  border: 1.5px solid transparent;
+  border-radius: 12px;
+  background: var(--input-bg);
+  overflow: hidden;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+html[data-scheme='dark'] .link-input {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.link-input:focus-within {
+  border-color: var(--accent);
+}
+
+.link-input.invalid {
+  border-color: var(--danger);
+}
+
+/* Prefiks uzun bo'lsa chap tomondan qisqartiriladi — "?start=" (nom oldidagi qism) doim ko'rinadi */
+.link-prefix {
+  flex: 0 1 auto;
+  min-width: 0;
+  align-self: center;
+  padding-left: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  color: var(--hint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.link-prefix > span {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.link-input .input,
+html[data-scheme='dark'] .link-input .input {
+  flex: 1 0 96px;
+  min-width: 96px;
+  width: auto;
+  padding-left: 1px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 16px;
+}
+
+.client-link-box {
+  margin-top: 0;
+}
+
+.client-link-note {
+  margin: -6px 0 0;
+  padding-bottom: 14px;
+}
+
+.link-card {
+  margin-top: 12px;
+  padding: 14px 16px 2px;
+  border-radius: 18px;
+  background: var(--section);
+  box-shadow: var(--card-shadow);
+  text-align: left;
+}
+
+.link-card-title {
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.link-card-sub {
+  margin: 3px 0 10px;
+  font-size: 13px;
+  color: var(--hint);
+  line-height: 1.4;
+}
+
+.link-card-empty {
+  padding-bottom: 14px;
+  font-size: 14px;
+  color: var(--hint);
+}
+
 .callout {
   display: flex;
   gap: 10px;

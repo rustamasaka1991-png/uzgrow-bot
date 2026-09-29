@@ -14,10 +14,13 @@ import {
   getSetting,
   getStaff,
   getStats,
+  isValidLinkCode,
   listAllStaff,
+  normalizeLinkCode,
   regenerateInvite,
   setSetting,
   setState,
+  setStaffLinkCode,
   setStaffPhoto,
   softDeleteStaff,
   unlinkStaff,
@@ -35,6 +38,7 @@ import {
   STALE_BUTTON_TEXT,
   TEXT_LIMIT,
   callbackMessage,
+  clientLinkOf,
   fmtNum,
   isCommandMessage,
   isMainButton,
@@ -43,6 +47,7 @@ import {
   parseId,
   render,
   sendHtml,
+  shareUrl,
   stripKeyboard,
   type StaffContext,
   type View,
@@ -55,8 +60,10 @@ const ADD_STAGES: readonly AddStage[] = ['role', 'name', 'position', 'descriptio
 const STAGE_NO: Record<AddStage, number> = { role: 1, name: 2, position: 3, description: 4, greeting: 5, photo: 6 };
 
 type TextField = 'full_name' | 'position' | 'description' | 'greeting';
-type EditField = TextField | 'photo';
-const EDIT_FIELDS: readonly EditField[] = ['full_name', 'position', 'description', 'greeting', 'photo'];
+/** `link_code` — mijozlar uchun shaxsiy havola nomi (t.me/<mijoz_boti>?start=<nom>). */
+type EditField = TextField | 'photo' | 'link_code';
+// Tartib muhim: stateTag() indeksni ishlatadi — yangi maydonlar faqat oxiriga qo'shiladi
+const EDIT_FIELDS: readonly EditField[] = ['full_name', 'position', 'description', 'greeting', 'photo', 'link_code'];
 
 type SettingName = 'welcome' | 'greeting' | 'offline';
 
@@ -150,7 +157,24 @@ const FIELD_TITLES: Record<EditField, string> = {
   description: 'tavsif',
   greeting: 'avto-javob',
   photo: 'rasm',
+  link_code: 'havola nomi',
 };
+
+/** Havola nomi qoidalari (so'rov va xato matnlarida). */
+const LINK_RULES = "2–32 ta lotin harfi, raqam yoki _; masalan: aziza";
+const LINK_INVALID = `Bu nom to'g'ri emas — ${LINK_RULES}`;
+const LINK_TAKEN = 'Bu nom band, boshqasini yozing';
+const LINK_TEXT_ONLY = `Iltimos, nomni matn ko'rinishida yuboring (${LINK_RULES})`;
+
+/**
+ * Admin yozgan havola nomi: to'liq havola yuborilsa ham (…?start=aziza) nom ajratib olinadi, keyin
+ * normalizeLinkCode (kichik harf, bo'sh joylarsiz).
+ */
+function linkCodeInput(text: string): string {
+  const t = text.trim();
+  const m = /[?&]start=([^\s&#]+)/i.exec(t);
+  return normalizeLinkCode(m ? m[1]! : t);
+}
 
 const CANCEL_KB = () => new InlineKeyboard().text('✖️ Bekor qilish', 'adm:cancel');
 const DROPPED_TEXT = 'ℹ️ Tugallanmagan admin amali bekor qilindi.';
@@ -485,6 +509,12 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
       link = `inv_${s.invite_code}`;
     }
   }
+  // Mijozlar uchun shaxsiy havola (taklif havolasidan farqli: u xodimning o'zi uchun, bu — mijozlar uchun)
+  const clientLink = await clientLinkOf(s);
+  const clientLinkLine = clientLink
+    ? `🔗 Mijozlar uchun havola: ${esc(clientLink)}` +
+      (!linked ? ' (akkaunt ulangandan keyin ishlaydi)' : !s.is_active ? ' (xodim faollashtirilgach ishlaydi)' : '')
+    : `🔗 Mijozlar uchun havola nomi: <code>${esc(s.link_code ?? `staff_${s.id}`)}</code>`;
 
   const build = (descMax: number, greetMax: number): string => {
     const lines: string[] = [];
@@ -514,15 +544,16 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
         ? `🤖 Avto-javob:\n<blockquote>${esc(truncate(s.greeting, greetMax))}</blockquote>`
         : '🤖 Avto-javob: <i>standart</i>',
     );
+    lines.push('', clientLinkLine);
     if (link) {
       lines.push(
         '',
-        '🔗 <b>Taklif havolasi</b> (bosib nusxalang):',
+        "📨 <b>Taklif havolasi</b> — xodimning o'ziga (bosib nusxalang):",
         `<code>${esc(link)}</code>`,
         "Havolani xodimga yuboring — u bosib, Telegram akkauntini ulaydi. Havola bir martalik.",
       );
     } else if (!linked) {
-      lines.push('', "🔗 Taklif havolasi yo'q — «🔗 Yangi havola» tugmasini bosing.");
+      lines.push('', "📨 Taklif havolasi yo'q — «🔗 Yangi havola» tugmasini bosing.");
     }
     if (linked && !s.is_active) {
       lines.push('', "ℹ️ Xodim o'chirib qo'yilgan: mijozlar uni menyuda ko'rmaydi va unga yoza olmaydi, u ham mijozlarga yoza olmaydi.");
@@ -541,13 +572,15 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
     .text('🖼 Rasm', `adm:e:${id}:photo`)
     .text(`🔄 Rol: ${roleLabel(s.role)}`, `adm:role:${id}`)
     .row()
+    .text('✏️ Havola nomi', `adm:e:${id}:link_code`);
+  if (clientLink) kb.url('📤 Mijozlarga ulashish', shareUrl(clientLink));
+  kb.row()
     .text(s.is_active ? "⛔ O'chirib qo'yish" : '✅ Faollashtirish', `adm:act:${id}`);
   if (!linked) kb.text('🔗 Yangi havola', `adm:inv:${id}`);
   kb.row();
   if (link && link.startsWith('https://')) {
     const shareText = `${s.full_name}, ushbu havola orqali xodimlar botiga ulaning 👆`;
-    const share = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`;
-    kb.url('📤 Havolani ulashish', share).copyText('📋 Nusxalash', link).row();
+    kb.url('📤 Havolani ulashish', shareUrl(link, shareText)).copyText('📋 Nusxalash', link).row();
   }
   if (linked) kb.text('🔌 Akkauntni uzish', `adm:unl:${id}`);
   kb.text("🗑 O'chirish", `adm:del:${id}`).row();
@@ -622,9 +655,21 @@ async function addPromptView(st: AddState, error?: string): Promise<View> {
   return { text: lines.join('\n'), keyboard: kb };
 }
 
-function editPromptView(s: Staff, field: EditField, error?: string): View {
+async function editPromptView(s: Staff, field: EditField, error?: string): Promise<View> {
   const lines = [`✏️ <b>${esc(s.full_name)}</b> — ${FIELD_TITLES[field]}ni o'zgartirish`, ''];
   switch (field) {
+    case 'link_code': {
+      const link = await clientLinkOf(s);
+      lines.push(
+        `Hozirgi nom: ${s.link_code ? `<code>${esc(s.link_code)}</code>` : '—'}`,
+        ...(link ? [`Havola: ${esc(link)}`] : []),
+        '',
+        `✍️ Yangi nomni yuboring: ${esc(LINK_RULES)}`,
+        "⚠️ Nom o'zgarsa, eski havola ishlamay qoladi.",
+      );
+      if (error) lines.push('', `❌ ${esc(error)}`);
+      return { text: lines.join('\n'), keyboard: CANCEL_KB() };
+    }
     case 'full_name':
       lines.push(`Hozirgi ism: <code>${esc(s.full_name)}</code>`, '', 'Yangi ismni yuboring (2–64 belgi).');
       break;
@@ -860,7 +905,7 @@ function stateLabel(st: InputState): string {
     case 'add':
       return `➕ yangi xodim, ${STAGE_NO[st.stage]}/6-qadam`;
     case 'edit':
-      return `✏️ xodim ${FIELD_TITLES[st.field]}i`;
+      return st.field === 'link_code' ? '✏️ xodim havola nomi' : `✏️ xodim ${FIELD_TITLES[st.field]}i`;
     case 'setting':
       return SETTINGS[st.key].title;
   }
@@ -1158,7 +1203,8 @@ async function finishAdd(
 
   const notice =
     "✅ <b>Yangi xodim qo'shildi!</b>\n" +
-    "📨 Taklif havolasini xodimga yuboring — u havolani bosib, Telegram akkauntini ulaydi. Shundan so'ng mijozlar uni menyuda ko'radi.";
+    "📨 Taklif havolasini xodimga yuboring — u havolani bosib, Telegram akkauntini ulaydi. Shundan so'ng mijozlar uni menyuda ko'radi.\n" +
+    "🔗 Mijozlar uchun havolasi ham tayyor (quyida) — mijoz shu havola orqali kirsa, darhol shu xodim bilan chat boshlanadi.";
   await render(ctx, await cardView(s, notice), viaCallback ? 'edit' : 'new');
 }
 
@@ -1277,7 +1323,7 @@ async function reprompt(ctx: StaffContext, st: InputState, error: string, msg: T
       });
       return;
     }
-    view = editPromptView(s, cur.field, error);
+    view = await editPromptView(s, cur.field, error);
   } else {
     view = await settingView(cur.key, error);
   }
@@ -1302,7 +1348,7 @@ async function startEdit(ctx: StaffContext, id: number | null, field: string | u
   }
   const st: EditState = { step: 'edit', staffId: s.id, field: field as EditField };
   await ctx.answerCallbackQuery();
-  await enterState(ctx, st, editPromptView(s, st.field), 'edit');
+  await enterState(ctx, st, await editPromptView(s, st.field), 'edit');
 }
 
 async function showUpdated(ctx: StaffContext, s: Staff | null, notice: string): Promise<void> {
@@ -1325,6 +1371,8 @@ async function handleEditInput(ctx: StaffContext, msg: TgMessage, st: EditState)
     return;
   }
   const isDash = msg.text?.trim() === '-';
+
+  if (st.field === 'link_code') return handleLinkCodeInput(ctx, msg, st, s);
 
   if (st.field === 'photo') {
     if (isDash) {
@@ -1373,6 +1421,40 @@ async function handleEditInput(ctx: StaffContext, msg: TgMessage, st: EditState)
   const notice =
     field === 'greeting' && patch.greeting === null ? '♻️ Avto-javob standart matnga qaytarildi.' : '✅ Saqlandi.';
   return showUpdated(ctx, u, notice);
+}
+
+/**
+ * Mijozlar havolasi nomini o'zgartirish (`adm:e:<id>:link_code`). Noto'g'ri yoki band nom — so'rov qoida bilan
+ * qayta ko'rsatiladi (holat saqlanib qoladi, admin boshqa nom yozadi); muvaffaqiyatli — yangilangan karta.
+ */
+async function handleLinkCodeInput(ctx: StaffContext, msg: TgMessage, st: EditState, s: Staff): Promise<void> {
+  const uid = ctx.from!.id;
+  if (msg.text === undefined) return reprompt(ctx, st, LINK_TEXT_ONLY, msg);
+  const code = linkCodeInput(msg.text);
+  if (!isValidLinkCode(code)) return reprompt(ctx, st, LINK_INVALID, msg);
+
+  if (!(await casState(uid, st, null))) return;
+  const r = await saveOrRestore(ctx, st, () => setStaffLinkCode(s.id, code));
+  if (r === undefined) return;
+  if (!r.ok) {
+    if (r.reason === 'not_found') {
+      await stripKeyboard(ctx, st.promptMsgId);
+      return showUpdated(ctx, null, '');
+    }
+    // Band (yoki noto'g'ri) nom: holat qaytariladi — keyingi xabar yana havola nomi sifatida qabul qilinadi
+    await setState('staff', uid, st);
+    return reprompt(ctx, st, r.reason === 'taken' ? LINK_TAKEN : LINK_INVALID, null);
+  }
+
+  const u = r.staff;
+  await stripKeyboard(ctx, st.promptMsgId);
+  const changed = (s.link_code ?? '').toLowerCase() !== (u.link_code ?? '').toLowerCase();
+  if (changed && u.tg_user_id && u.tg_user_id !== uid) {
+    // Xodim eski havolani mijozlarga bergan bo'lishi mumkin — yangisini bilsin
+    const link = await clientLinkOf(u);
+    if (link) await notifyUser(ctx, u.tg_user_id, STAFF_NOTICE.linkChanged(link));
+  }
+  return showUpdated(ctx, u, changed ? "✅ Havola nomi saqlandi. Eski havola endi ishlamaydi." : '✅ Saqlandi.');
 }
 
 /**

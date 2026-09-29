@@ -1,6 +1,7 @@
 // Mijozlar boti: tugmalar, matnlar va ro'yxat/transkript ko'rinishlari (sof funksiyalar — tarmoq/baza yo'q).
-import { InlineKeyboard, Keyboard } from 'grammy';
-import type { InlineKeyboardButton, InlineKeyboardMarkup } from 'grammy/types';
+// Mijozlar botida Mini App (web_app) tugmalari ham, doimiy pastki klaviatura ham yo'q — faqat inline tugmalar.
+import { InlineKeyboard } from 'grammy';
+import type { InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove } from 'grammy/types';
 import type { ConversationView, Message, Role, Staff } from '../../types.js';
 import {
   KIND_LABELS,
@@ -28,6 +29,10 @@ export const HISTORY_PAGE_SIZE = 10;
 
 // ───────────────────────────── Matnlar ─────────────────────────────
 
+/**
+ * Tugma matnlari. `chats`/`help` — eski doimiy klaviatura yorliqlari: endi ko'rsatilmaydi, lekin eski
+ * klaviaturasi qolgan mijozlar uchun ular hali ham ishlaydi.
+ */
 export const BTN = {
   operators: '👨‍💻 Operatorlar',
   managers: '👔 Menejerlar',
@@ -35,13 +40,20 @@ export const BTN = {
   help: 'ℹ️ Yordam',
 } as const;
 
+/** Eski doimiy pastki klaviaturani olib tashlash (ulanish xabarlari va /help bilan yuboriladi). */
+export const REMOVE_KEYBOARD: ReplyKeyboardRemove = { remove_keyboard: true };
+
 export const T = {
   error: "⚠️ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.",
   staffUnavailable: 'Bu xodim hozir mavjud emas',
   convNotFound: '⛔ Bu suhbat topilmadi',
   picked: '✅ Tanlandi',
   convSelected: '✅ Suhbat tanlandi',
-  staleButton: "Bu tugma eskirgan. /menu buyrug'ini yuboring.",
+  staleButton: "Bu tugma eskirgan. /start buyrug'ini yuboring.",
+  /** Eski mijozga bir marta: v1 dagi doimiy pastki menyu olib tashlandi (remove_keyboard bilan yuboriladi). */
+  legacyKeyboardRemoved: '✨ Bot yangilandi — endi yanada sodda. Pastdagi eski menyu olib tashlandi.',
+  /** Shaxsiy havola (/start <nom>) bo'yicha xodim topilmadi yoki u hozir mavjud emas. */
+  linkNotFound: "⚠️ Bu havola bo'yicha xodim topilmadi yoki u hozir ishlamayapti.",
   /** Xodim tanlanmagan: xabar saqlandi (birinchi saqlangan xabar). */
   chooseFirst:
     'Avval kim bilan yozishmoqchi ekaningizni tanlang 👇\n\n' +
@@ -71,39 +83,122 @@ export const T = {
   unsupported:
     "⚠️ Bu turdagi xabarni yuborib bo'lmaydi.\n\n" +
     "Matn, rasm, video, GIF, fayl, audio, ovozli yoki video xabar, stiker, joylashuv yoki kontakt yuborishingiz mumkin.",
+  /** Noma'lum /buyruq — qisqa yordam (xabar xodimga yuborilmaydi). */
   unknownCommand:
     "🤔 Bunday buyruq yo'q — xabaringiz xodimga yuborilmadi.\n\n" +
-    '/menu — asosiy menyu\n' +
-    '/operators — operatorlar\n' +
-    '/managers — menejerlar\n' +
-    '/chats — suhbatlarim\n' +
+    '✍️ Savolingizni oddiy xabar qilib yozing.\n' +
+    '/start — xodim tanlash\n' +
     '/help — yordam',
-  startMenuWithApp: 'Yoki qulay menyu orqali tanlang 👇',
-  startMenuNoApp: "👇 Kim bilan bog'lanmoqchisiz?",
-  menu: "🏠 <b>Asosiy menyu</b>\n\nKim bilan bog'lanmoqchisiz? 👇",
-  deepLinkMissing: "⚠️ Siz so'ragan xodim hozir mavjud emas. Boshqa xodimni tanlang.",
   choose: "🔄 <b>Boshqa xodim tanlash</b>\n\nKim bilan bog'lanmoqchisiz? 👇",
 } as const;
 
-export function helpText(hasWebApp: boolean): string {
+/** /help — qisqa (klaviaturasiz). */
+export function helpText(): string {
+  return [
+    'ℹ️ <b>Botdan qanday foydalaniladi?</b>',
+    '',
+    "✍️ Savolingizni shu chatga yozing — matn, rasm, fayl yoki ovozli xabar bo'lishi mumkin.",
+    '💬 Xodimning javobi ham shu yerga keladi.',
+    '🔄 Boshqa xodim tanlash uchun: /start',
+  ].join('\n');
+}
+
+// ───────────────────────────── Ulanish xabarlari ─────────────────────────────
+// Nomlar xom (esc qilinmagan) holda beriladi — shu yerda esc() qilinadi.
+
+/** Xodim hozir javob bera olmaydi: oflayn yoki xodimlar botini to'xtatgan (avto-javobdagi mezon bilan bir xil). */
+export function isStaffOffline(s: Pick<Staff, 'is_online' | 'bot_blocked'>): boolean {
+  return !s.is_online || s.bot_blocked === true;
+}
+
+export const OFFLINE_LINE = '🕐 Hozir oflayn — imkon qadar tezroq javob beradi.';
+
+/** Rol qatori: "👨‍💻 Operator · Katta operator" (HTML). */
+function roleLineHtml(s: Pick<Staff, 'role' | 'position'>): string {
+  const position = oneLine(s.position, 150);
+  return `${roleIcon(s.role)} ${roleLabel(s.role)}${position ? ` · ${esc(position)}` : ''}`;
+}
+
+export interface LinkWelcomeInput {
+  /** Mijozning ismi (Telegram first_name). */
+  clientName: string;
+  staff: Pick<Staff, 'full_name' | 'role' | 'position' | 'is_online' | 'bot_blocked'>;
+  /** Suhbatda avval xabarlar bo'lganmi ("Siz yana ... bilan suhbatdasiz"). */
+  existing: boolean;
+  /** Shu ulanishda yuborilgan saqlangan xabarlar soni. */
+  heldSent?: number;
+  /** Saqlangan xabar xodimga hozircha yetkazilmadi. */
+  undelivered?: boolean;
+}
+
+/**
+ * Shaxsiy havola (/start <nom>) orqali kirganda yagona xabar — xodim rasmi izohi (HTML, ≤ 1024 belgi):
+ *   👋 Assalomu alaykum, Ali!
+ *
+ *   Siz <b>Aziza</b> bilan bog'landingiz.
+ *   👨‍💻 Operator · Katta operator
+ *   🕐 Hozir oflayn — imkon qadar tezroq javob beradi.   (oflayn bo'lsa)
+ *
+ *   ✍️ Savolingizni shu yerga yozing.
+ */
+export function linkWelcomeCaption(input: LinkWelcomeInput): string {
+  const client = oneLine(input.clientName, 64);
+  const name = esc(staffName(input.staff));
   const lines = [
-    "ℹ️ <b>Botdan qanday foydalaniladi?</b>",
+    client ? `👋 Assalomu alaykum, ${esc(client)}!` : '👋 Assalomu alaykum!',
     '',
-    `1️⃣ <b>${BTN.operators}</b> yoki <b>${BTN.managers}</b> tugmasini bosing.`,
-    "2️⃣ Kerakli xodimni tanlang va <b>✍️ Yozish</b> tugmasini bosing.",
-    "3️⃣ Savolingizni yozing — matn, rasm, video, fayl yoki ovozli xabar. " +
-      "Xabaringiz tanlangan xodimga shaxsan yetkaziladi, javobi esa shu chatga keladi.",
-    '',
-    "🤖 Xodimga birinchi marta yozganingizda avtomatik javob keladi, so'ng xodimning o'zi javob yozadi.",
-    `<b>${BTN.chats}</b> — barcha suhbatlaringiz va ularning tarixi. ` +
-      "Boshqa xodimga o'tish uchun kerakli suhbatni tanlang.",
-    "↩️ Xodim xabariga <b>javob (Reply)</b> qilsangiz, xabaringiz aynan o'sha xodimga boradi.",
+    input.existing ? `Siz yana <b>${name}</b> bilan suhbatdasiz.` : `Siz <b>${name}</b> bilan bog'landingiz.`,
+    roleLineHtml(input.staff),
   ];
-  if (hasWebApp) {
-    lines.push("📱 <b>Menyu</b> tugmasi orqali hammasini qulay ilova ko'rinishida ham qilishingiz mumkin.");
+  if (isStaffOffline(input.staff)) lines.push(OFFLINE_LINE);
+  lines.push('');
+  if (input.heldSent && input.heldSent > 0) {
+    lines.push(`${heldSentLine(input.heldSent, staffName(input.staff))} Javob shu yerga keladi.`);
+    if (input.undelivered) lines.push('', undeliveredShortNote(staffName(input.staff)));
+  } else {
+    lines.push('✍️ Savolingizni shu yerga yozing.');
   }
-  lines.push('', "🔒 Yozishmalaringizni faqat siz tanlagan xodim ko'radi.");
   return lines.join('\n');
+}
+
+/** Oddiy /start (yoki /menu): mavjud xodim bilan faol suhbat bor. */
+export function activeStartText(name: string): string {
+  return `👋 Siz <b>${esc(name)}</b> bilan suhbatdasiz — savolingizni shu yerga yozavering.`;
+}
+
+export interface PickedInput {
+  staff: Pick<Staff, 'full_name' | 'role' | 'is_online' | 'bot_blocked'>;
+  existing: boolean;
+  heldSent: number;
+  undelivered: boolean;
+}
+
+/**
+ * «✍️ Yozish» (pick:) tasdig'i:
+ *   ✅ Siz <b>Aziza</b> (Operator) bilan bog'landingiz.
+ *   ✍️ Savolingizni yozing.
+ * Suhbatda xabarlar bo'lsa — "… bilan bog'landingiz — suhbat davom etmoqda.". Saqlangan xabarlar yuborilgan
+ * bo'lsa ✍️ qatori o'rniga "📨 … yuborildi. Javob shu yerga keladi.".
+ */
+export function pickedText(input: PickedInput): string {
+  const raw = staffName(input.staff);
+  const who = `<b>${esc(raw)}</b> (${roleLabel(input.staff.role)})`;
+  let text = input.existing
+    ? `✅ Siz yana ${who} bilan bog'landingiz — suhbat davom etmoqda.`
+    : `✅ Siz ${who} bilan bog'landingiz.`;
+  text += input.heldSent > 0 ? `\n${heldSentLine(input.heldSent, raw)} Javob shu yerga keladi.` : '\n✍️ Savolingizni yozing.';
+  // Yangi suhbatda birinchi xabar yuborilgan bo'lsa, oflayn izohi avto-javobning o'zida bor
+  if (isStaffOffline(input.staff) && !(input.heldSent > 0 && !input.existing)) text += `\n\n${OFFLINE_LINE}`;
+  if (input.undelivered) text += `\n\n${undeliveredShortNote(raw)}`;
+  return text;
+}
+
+/** Saqlangan xabar xodimga hozircha yetkazilmadi — tugmasiz variant (ulanish xabarlari uchun). */
+export function undeliveredShortNote(name: string): string {
+  return (
+    `ℹ️ Xabaringiz saqlandi, lekin <b>${esc(name)}</b>${dativeSuffix(name)} hozircha yetkazib bo'lmadi — ` +
+    "javob biroz kechikishi mumkin. Shoshilinch bo'lsa, /start orqali boshqa xodimni tanlang."
+  );
 }
 
 // ───────────────────────────── Yo'naltirish xabarlari ─────────────────────────────
@@ -182,10 +277,7 @@ export function cb(text: string, data: string): InlineKeyboardButton {
   return InlineKeyboard.text(text, data);
 }
 
-export function webAppBtn(text: string, url: string): InlineKeyboardButton {
-  return InlineKeyboard.webApp(text, url);
-}
-
+/** [👨‍💻 Operatorlar `ls:operator`] [👔 Menejerlar `ls:manager`] */
 export function roleRow(): InlineKeyboardButton[] {
   return [cb(BTN.operators, 'ls:operator'), cb(BTN.managers, 'ls:manager')];
 }
@@ -193,19 +285,6 @@ export function roleRow(): InlineKeyboardButton[] {
 /** Shu suhbatni faol qilib, unga yozish tugmasi (callback to:<convId>). */
 export function writeToButton(conversationId: number, name: string): InlineKeyboardButton {
   return cb(`↩️ ${dative(oneLine(name, 40) || 'Xodim')} yozish`, `to:${conversationId}`);
-}
-
-/** Doimiy pastki klaviatura. */
-export function mainKeyboard(): Keyboard {
-  return new Keyboard()
-    .text(BTN.operators)
-    .text(BTN.managers)
-    .row()
-    .text(BTN.chats)
-    .text(BTN.help)
-    .resized()
-    .persistent()
-    .placeholder('Xabaringizni yozing…');
 }
 
 /** Sahifalash qatori: [⬅️] [2/5] [➡️] (faqat mavjud yo'nalishlar). */
@@ -252,17 +331,14 @@ export function renderStaffList(
   role: Role,
   staff: Staff[],
   page: number,
-  webAppUrl: string,
 ): { text: string; markup: InlineKeyboardMarkup } {
-  const appRow = webAppUrl ? [webAppBtn("📱 Menyuda ko'rish", webAppUrl)] : [];
-
   if (!staff.length) {
     const other: Role = role === 'manager' ? 'operator' : 'manager';
     const text =
       `${roleTitle(role)}\n\n` +
       `😔 Hozircha ${rolePlural(role)} yo'q. Birozdan keyin qayta urinib ko'ring.`;
     const otherBtn = other === 'manager' ? cb(BTN.managers, 'ls:manager') : cb(BTN.operators, 'ls:operator');
-    return { text, markup: markup([[otherBtn], appRow]) };
+    return { text, markup: markup([[otherBtn]]) };
   }
 
   const pages = Math.ceil(staff.length / LIST_PAGE_SIZE);
@@ -288,7 +364,6 @@ export function renderStaffList(
 
   const rows: Rows = slice.map((s) => [cb(`${statusIcon(s)} ${oneLine(s.full_name, 48) || 'Xodim'}`, `card:${s.id}`)]);
   rows.push(pagerRow(`ls:${role}`, p, pages));
-  rows.push(appRow);
   return { text, markup: markup(rows) };
 }
 
@@ -351,13 +426,10 @@ export function renderChats(
   activeId: number | null,
   availableStaffIds: Set<number>,
   page: number,
-  webAppUrl: string,
 ): { text: string; markup: InlineKeyboardMarkup } {
   if (!convs.length) {
     const text = "💬 Sizda hali suhbatlar yo'q.\n\nOperator yoki menejerni tanlang va unga yozing 👇";
-    const rows: Rows = [roleRow()];
-    if (webAppUrl) rows.push([webAppBtn('📱 Menyuni ochish', webAppUrl)]);
-    return { text, markup: markup(rows) };
+    return { text, markup: markup([roleRow()]) };
   }
 
   const pages = Math.ceil(convs.length / CHATS_PAGE_SIZE);

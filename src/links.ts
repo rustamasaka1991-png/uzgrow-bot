@@ -54,8 +54,19 @@ export async function inviteLink(code: string): Promise<string> {
   return name ? `https://t.me/${name}?start=inv_${code}` : `inv_${code}`;
 }
 
-/** Mijoz boti orqali ma'lum xodimga to'g'ridan-to'g'ri havola: https://t.me/<client_bot>?start=staff_<id> */
-export async function staffDeepLink(staffId: number): Promise<string> {
+/**
+ * Mijozlar uchun xodimning shaxsiy qisqa havolasi: https://t.me/<mijoz_boti>?start=<link_code> (masalan ...?start=aziza).
+ * Mijoz shu havola orqali kirsa — hech narsa tanlamasdan shu xodim bilan chat boshlanadi.
+ */
+export async function staffClientLink(staff: { id: number; link_code: string | null }): Promise<string> {
   const name = await botUsername('client');
-  return name ? `https://t.me/${name}?start=staff_${staffId}` : '';
+  const code = staff.link_code || `staff_${staff.id}`;
+  return name ? `https://t.me/${name}?start=${code}` : '';
+}
+
+/** Eski nom (moslik uchun): endi qisqa havola nomini ishlatadi. */
+export async function staffDeepLink(staffId: number): Promise<string> {
+  const { getStaff } = await import('./repo.js');
+  const s = await getStaff(staffId);
+  return staffClientLink({ id: staffId, link_code: s?.link_code ?? null });
 }

@@ -1,9 +1,12 @@
 // Mini App backend: POST /api/app
 // So'rov: JSON { initData, action, ...params } yoki multipart/form-data (fayl yuklash uchun: initData, action, ..., file).
 // Javob: { ok: true, ...data } yoki { ok: false, error: <kod>, message: <o'zbekcha matn> }.
+// Mini App faqat xodimlar (va admin) uchun: mijozlar boti orqali ochilgan initData bilan har qanday amal
+// 403 client_app_disabled qaytaradi (mijozlar faqat bot chatida yozadi). Mijoz tomonidagi eski kod yo'llari
+// (ClientCtx) endi ishlatilmaydi, lekin umumiy funksiyalar bilan chambarchas bog'liq bo'lgani uchun qoldirilgan.
 import { createHash } from 'node:crypto';
 import { InputFile } from 'grammy';
-import { verifyInitData, type WebAppUser } from '../auth.js';
+import { verifyInitData, type WebAppAuth, type WebAppUser } from '../auth.js';
 import { isAdmin } from '../config.js';
 import { json } from '../http.js';
 import {
@@ -27,7 +30,9 @@ import {
   getMessage,
   getOrCreateConversation,
   getSetting,
+  isValidLinkCode,
   getStaff,
+  getStaffByLinkCode,
   getStaffByTgId,
   getStats,
   isStaffAvailable,
@@ -36,18 +41,19 @@ import {
   listMessages,
   listStaffConversations,
   markReadByClient,
+  normalizeLinkCode,
   markReadByStaff,
   regenerateInvite,
   setClientActiveConversation,
   setClientBlocked,
   setSetting,
+  setStaffLinkCode,
   setStaffPhoto,
   softDeleteStaff,
   unlinkStaff,
   updateMessageDelivery,
   updateStaff,
   updateStaffUsername,
-  upsertClient,
   type StaffEditableField,
 } from '../repo.js';
 import { DEFAULT_GREETING, DEFAULT_OFFLINE_NOTE, DEFAULT_WELCOME, SETTING_KEYS, STAFF_NOTICE } from '../texts.js';
@@ -63,6 +69,8 @@ import {
   clientConvSummary,
   clientRowFrom,
   messageDTO,
+  safeClientBotUsername,
+  safeClientLink,
   staffCardDTO,
   staffConvSummary,
   staffProfileDTO,
@@ -111,6 +119,9 @@ export class ApiError extends Error {
 
 const MSG = {
   unauthorized: 'Sessiya eskirgan. Mini App ni qayta oching.',
+  clientAppDisabled: 'Bu ilova faqat xodimlar uchun. Iltimos, bot chatiga qayting va shu yerda yozing.',
+  linkInvalid: "Havola nomi 2–32 ta lotin harfi, raqam yoki _ bo'lishi kerak",
+  linkTaken: 'Bu havola nomi band',
   notStaff: "⛔ Siz xodimlar ro'yxatida yo'qsiz. Admin bergan taklif havolasi orqali xodimlar botiga ulaning.",
   badRequest: "⚠️ Noto'g'ri so'rov.",
   noAction: "⚠️ So'rovda amal (action) ko'rsatilmagan.",
@@ -400,31 +411,21 @@ interface StaffCtx {
 
 type Ctx = ClientCtx | StaffCtx;
 
-function tgUser(u: WebAppUser) {
-  return {
-    id: u.id,
-    first_name: u.first_name ?? '',
-    last_name: u.last_name,
-    username: u.username,
-    language_code: u.language_code,
-  };
-}
-
-async function buildContext(parsed: ParsedRequest): Promise<Ctx> {
+/**
+ * initData ni tekshirish. Mijozlar boti orqali ochilgan Mini App — 403 client_app_disabled: mijozlar uchun
+ * ilova o'chirilgan (ular bot chatida yozadi). Bazaga hech narsa yozilmaydi va murojaat ham qilinmaydi.
+ */
+function authenticate(parsed: ParsedRequest): WebAppAuth {
+  if (!parsed.initData) throw new ApiError(401, 'unauthorized', MSG.unauthorized);
   const auth = verifyInitData(parsed.initData);
   if (!auth) throw new ApiError(401, 'unauthorized', MSG.unauthorized);
+  if (auth.bot !== 'staff') throw new ApiError(403, 'client_app_disabled', MSG.clientAppDisabled);
+  return auth;
+}
+
+/** Xodim/admin konteksti (faqat xodimlar boti initData si bilan — authenticate() dan keyin). */
+async function buildContext(auth: WebAppAuth, parsed: ParsedRequest): Promise<Ctx> {
   const { user } = auth;
-
-  if (auth.bot === 'client') {
-    // Ma'lumotlar faqat bootstrap da yangilanadi (sync har ~3 soniyada — yozuvsiz, arzon bo'lishi kerak)
-    // Mini App ochilgani bot chati bloklanmaganini bildirmaydi — bot_blocked belgisiga tegmaymiz.
-    const client =
-      parsed.action === 'bootstrap'
-        ? await upsertClient(tgUser(user), { unblock: false })
-        : (await getClient(user.id)) ?? (await upsertClient(tgUser(user), { unblock: false }));
-    return { role: 'client', user, client, params: parsed.params, file: parsed.file };
-  }
-
   const me = await getStaffByTgId(user.id);
   const admin = isAdmin(user.id);
   if (!me && !admin) throw new ApiError(403, 'not_staff', MSG.notStaff);
@@ -652,6 +653,8 @@ async function staffBootstrap(ctx: StaffCtx): Promise<Data> {
     role: 'staff',
     is_admin: admin,
     user: { id: user.id, first_name: user.first_name ?? '', username: user.username ?? null },
+    // Mijozlar boti username i: shaxsiy havolalar prefiksi (t.me/<client_bot>?start=...), '' — aniqlanmagan
+    client_bot: await safeClientBotUsername(),
   };
   if (!me) return { ...base, me: null, conversations: [], total: 0, has_more: false, active_conversation_id: null };
 
@@ -667,7 +670,7 @@ async function staffBootstrap(ctx: StaffCtx): Promise<Data> {
   const conversations = rows.map((r) => staffConvSummary(r, me.active_conversation_id));
   return {
     ...base,
-    me: staffProfileDTO({ ...me, tg_username: username }, totalUnread),
+    me: await staffProfileDTO({ ...me, tg_username: username }, totalUnread),
     conversations,
     list_sig: listSignature(conversations),
     total,
@@ -685,7 +688,7 @@ async function statusSet(ctx: Ctx): Promise<Data> {
   if (online === null) throw bad('bad_status', MSG.badStatus);
   const updated = online === me.is_online ? me : await updateStaff(me.id, { is_online: online });
   if (!updated) throw new ApiError(404, 'staff_not_found', MSG.staffNotFound);
-  return { me: staffProfileDTO(updated, await sumStaffUnread(updated.id)) };
+  return { me: await staffProfileDTO(updated, await sumStaffUnread(updated.id)) };
 }
 
 const CONV_PAGE = 50;
@@ -1194,12 +1197,37 @@ async function loadStaffForAdmin(id: number): Promise<Staff> {
 }
 
 async function adminStaffList(): Promise<Data> {
-  const list = await listAllStaff();
-  return { staff: await Promise.all(list.map((s) => adminStaffDTO(s))) };
+  const [list, clientBot] = await Promise.all([listAllStaff(), safeClientBotUsername()]);
+  return { staff: await Promise.all(list.map((s) => adminStaffDTO(s))), client_bot: clientBot };
 }
 
+function linkInvalid(): ApiError {
+  return new ApiError(400, 'link_invalid', MSG.linkInvalid);
+}
+
+function linkTaken(): ApiError {
+  return new ApiError(409, 'link_taken', MSG.linkTaken);
+}
+
+/**
+ * `link_code` (mijozlar uchun havola nomi): berilmagan — undefined; aks holda normallashtirilgan to'g'ri nom
+ * (2–32 ta lotin harfi, raqam yoki _; katta harflar kichikka o'giriladi). Noto'g'ri — 400 link_invalid.
+ */
+function linkCodeParam(src: Record<string, unknown>): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(src, 'link_code') || src.link_code === undefined) return undefined;
+  const code = typeof src.link_code === 'string' ? normalizeLinkCode(src.link_code) : '';
+  if (!isValidLinkCode(code)) throw linkInvalid();
+  return code;
+}
+
+/**
+ * Yangi xodim: ixtiyoriy `link_code` yaratilgandan keyin qo'llanadi. Bo'sh / berilmagan — ismdan avtomatik nom
+ * qoladi. Noto'g'ri yoki band bo'lsa ham xodim yaratiladi: avtomatik nom qoladi va javobda `warning` qaytadi.
+ */
 async function adminStaffCreate(ctx: StaffCtx): Promise<Data> {
   const fields = validateStaffFields(ctx.params, true);
+  const rawLink = ctx.params.link_code;
+  const wantLink = rawLink !== undefined && rawLink !== null && !(typeof rawLink === 'string' && !rawLink.trim());
   let staff = await createStaff({
     role: fields.role!,
     full_name: fields.full_name!,
@@ -1212,7 +1240,26 @@ async function adminStaffCreate(ctx: StaffCtx): Promise<Data> {
   if (fields.is_online !== undefined) extra.is_online = fields.is_online;
   if (fields.sort_order !== undefined) extra.sort_order = fields.sort_order;
   if (Object.keys(extra).length) staff = (await updateStaff(staff.id, extra)) ?? staff;
-  return { staff: await adminStaffDTO(staff) };
+
+  let linkWarning: { warning: string; warning_code: 'link_invalid' | 'link_taken' } | null = null;
+  if (wantLink) {
+    const code = typeof rawLink === 'string' ? normalizeLinkCode(rawLink) : '';
+    if (code !== (staff.link_code ?? '').toLowerCase()) {
+      const res = isValidLinkCode(code) ? await setStaffLinkCode(staff.id, code) : null;
+      if (res?.ok) staff = res.staff;
+      else {
+        const auto = staff.link_code ? ` Avtomatik nom qoldirildi: ${staff.link_code}` : '';
+        linkWarning =
+          res?.reason === 'taken'
+            ? { warning: `⚠️ Xodim qo'shildi, lekin «${code}» havola nomi band.${auto}`, warning_code: 'link_taken' }
+            : {
+                warning: `⚠️ Xodim qo'shildi, lekin havola nomi noto'g'ri (2–32 ta lotin harfi, raqam yoki _ bo'lishi kerak).${auto}`,
+                warning_code: 'link_invalid',
+              };
+      }
+    }
+  }
+  return { staff: await adminStaffDTO(staff), ...(linkWarning ?? {}) };
 }
 
 async function adminStaffUpdate(ctx: StaffCtx): Promise<Data> {
@@ -1224,13 +1271,38 @@ async function adminStaffUpdate(ctx: StaffCtx): Promise<Data> {
     src = rest;
   } else throw bad('bad_request', MSG.badRequest);
   const patch = validateStaffFields(src, false);
-  if (!Object.keys(patch).length) throw bad('no_patch', MSG.noPatch);
+  const linkCode = linkCodeParam(src);
+  if (!Object.keys(patch).length && linkCode === undefined) throw bad('no_patch', MSG.noPatch);
   const before = await loadStaffForAdmin(id);
-  const updated = await updateStaff(id, patch);
-  if (!updated) throw new ApiError(404, 'staff_not_found', MSG.staffNotFound);
+  // Havola nomi band bo'lsa — boshqa maydonlar ham o'zgartirilmaydi (admin formani tuzatib qayta yuboradi)
+  const linkChanged = linkCode !== undefined && linkCode !== (before.link_code ?? '').toLowerCase();
+  if (linkChanged) {
+    const holder = await getStaffByLinkCode(linkCode);
+    if (holder && holder.id !== id) throw linkTaken();
+  }
+  let updated: Staff | null = before;
+  if (Object.keys(patch).length) {
+    updated = await updateStaff(id, patch);
+    if (!updated) throw new ApiError(404, 'staff_not_found', MSG.staffNotFound);
+  }
+  // Havola nomi boshqa maydonlardan keyin qo'llanadi (setStaffLinkCode — yagona indeks bilan poyga ham tekshiriladi)
+  if (linkChanged) {
+    const res = await setStaffLinkCode(id, linkCode);
+    if (!res.ok) {
+      if (res.reason === 'taken') throw linkTaken();
+      if (res.reason === 'invalid') throw linkInvalid();
+      throw new ApiError(404, 'staff_not_found', MSG.staffNotFound);
+    }
+    updated = res.staff;
+  }
   // Faollashtirildi / o'chirib qo'yildi — xodimga xabar (o'zini o'zgartirgan admin uchun emas, bot bilan bir xil)
   if (updated.is_active !== before.is_active && updated.tg_user_id && updated.tg_user_id !== ctx.user.id) {
     await notifyStaffUser(updated.tg_user_id, updated.is_active ? STAFF_NOTICE.activated : STAFF_NOTICE.deactivated, false);
+  }
+  // Havola nomi o'zgardi — xodim eski havolani mijozlarga bergan bo'lishi mumkin: yangisini bilsin (bot bilan bir xil)
+  if (linkChanged && updated.tg_user_id && updated.tg_user_id !== ctx.user.id) {
+    const link = await safeClientLink(updated);
+    if (link) await notifyStaffUser(updated.tg_user_id, STAFF_NOTICE.linkChanged(link), false);
   }
   return { staff: await adminStaffDTO(updated) };
 }
@@ -1413,10 +1485,11 @@ export async function handleAppRequest(req: Request): Promise<Response> {
   try {
     const parsed = await parseRequest(req);
     action = parsed.action;
-    if (!parsed.initData) throw new ApiError(401, 'unauthorized', MSG.unauthorized);
+    // Imzo tekshiruvi va mijozlar uchun taqiq — bazaga murojaatdan oldin
+    const auth = authenticate(parsed);
     // Deploy migratsiyadan oldin chiqib qolgan bo'lsa — sxema shu yerda (instansiyada bir marta) yangilanadi
     await ensureSchema();
-    const ctx = await buildContext(parsed);
+    const ctx = await buildContext(auth, parsed);
     if (!action) throw bad('bad_request', MSG.noAction);
     const data = await dispatch(action, ctx);
     return json({ ...data, ok: true });

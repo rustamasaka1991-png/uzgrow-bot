@@ -185,6 +185,53 @@ export function targetFromBotMessage(msg: TgMessage | undefined, botId: number):
   return null;
 }
 
+/** Bot xabarida tugma yo'q yoki faqat rol tanlash (`ls:`) tugmalari bor — ular hech bir xodimga ishora qilmaydi. */
+function hasOnlyRoleButtons(msg: TgMessage): boolean {
+  for (const row of msg.reply_markup?.inline_keyboard ?? []) {
+    for (const b of row) {
+      const data = 'callback_data' in b ? b.callback_data : undefined;
+      if (data === undefined || !/^ls:(?:operator|manager)(?::\d{1,4})?$/.test(data)) return false;
+    }
+  }
+  return true;
+}
+
+/** Xabar matni/izohidagi qalin (bold) bo'laklar. */
+function boldTexts(msg: TgMessage): Set<string> {
+  const isText = msg.text !== undefined;
+  const text = (isText ? msg.text : msg.caption) ?? '';
+  const entities = (isText ? msg.entities : msg.caption_entities) ?? [];
+  const out = new Set<string>();
+  for (const e of entities) {
+    if (e.type !== 'bold') continue;
+    const s = text.slice(e.offset, e.offset + e.length).trim();
+    if (s) out.add(s);
+  }
+  return out;
+}
+
+/**
+ * Tugmasiz (yoki faqat rol tugmali) BOT xabari — shaxsiy havola orqali ulanish xabari
+ * ("Siz <b>Aziza</b> bilan bog'landingiz"), «✍️ Yozish» tasdig'i, /start dagi "Siz <b>…</b> bilan suhbatdasiz" va h.k.
+ * Ularda tugma bo'lmagani uchun suhbatni tugmalardan aniqlab bo'lmaydi; o'rniga xabarda QALIN yozilgan ism shu
+ * mijozning suhbatlaridan aynan BITTA xodimning ismiga to'liq mos kelsa — o'sha suhbat id si. Aks holda null
+ * (taxmin qilinmaydi). Xodim mavjudligi chaqiruvchida tekshiriladi.
+ */
+export async function conversationFromNamedStaff(
+  clientId: number,
+  msg: TgMessage | undefined,
+  botId: number,
+): Promise<number | null> {
+  if (!msg || msg.from?.id !== botId || !hasOnlyRoleButtons(msg)) return null;
+  const names = boldTexts(msg);
+  if (!names.size) return null;
+  const rows = await db()<{ conv_id: number; full_name: string }[]>`
+    select c.id as conv_id, s.full_name from conversations c join staff s on s.id = c.staff_id
+    where c.client_id = ${clientId}`;
+  const matches = rows.filter((r) => names.has(staffName(r)));
+  return matches.length === 1 ? Number(matches[0]!.conv_id) : null;
+}
+
 // ───────────────────────────── Yo'naltirish konteksti ─────────────────────────────
 
 export interface RouteInfo {

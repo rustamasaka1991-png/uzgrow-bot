@@ -5,7 +5,7 @@
  * Sxema versiyasi: SCHEMA_SQL o'zgarganda oshiriladi. Ilova ishga tushganda bazadagi versiya eski bo'lsa
  * (deploy migratsiyadan oldin chiqib qolsa) — idempotent migratsiya avtomatik bir marta bajariladi (ensureSchema).
  */
-export const SCHEMA_VERSION = '2026-09-27.2';
+export const SCHEMA_VERSION = '2026-09-28.2';
 
 export const SCHEMA_SQL = /* sql */ `
 create table if not exists staff (
@@ -141,6 +141,12 @@ alter table staff add column if not exists bot_blocked boolean not null default 
 alter table staff add column if not exists online_before_block boolean;
 -- Xodim aktiv suhbatni oxirgi marta aniq tanlagan vaqt (Reply'siz xabar kimga ketishini aniqlash uchun)
 alter table staff add column if not exists active_set_at timestamptz;
+-- Mijozlar uchun qisqa havola nomi: https://t.me/<mijoz_boti>?start=<link_code> (masalan "aziza")
+alter table staff add column if not exists link_code text;
+-- v1 da mijozlarga doimiy pastki menyu (reply keyboard) yuborilgan; v2 da u mijozning birinchi /start ida bir marta
+-- olib tashlanadi. Ustun qo'shilgan paytda mavjud mijozlar — true, keyin yaratilganlar — false (menyu olmagan).
+alter table clients add column if not exists legacy_keyboard boolean not null default true;
+alter table clients alter column legacy_keyboard set default false;
 
 -- Aylanma (circular) tashqi kalitlar: faqat mavjud bo'lmasa qo'shiladi
 do $$
@@ -157,6 +163,7 @@ begin
   end if;
 end $$;
 
+create unique index if not exists staff_link_code_uidx on staff (lower(link_code)) where link_code is not null;
 create index if not exists messages_conversation_idx on messages (conversation_id, id);
 create index if not exists messages_staff_map_idx on messages (staff_chat_id, staff_chat_msg_id) where staff_chat_msg_id is not null;
 create index if not exists messages_client_map_idx on messages (client_chat_msg_id) where client_chat_msg_id is not null;

@@ -1,18 +1,18 @@
 # Uzgrow — mijozlar va xodimlar uchun Telegram botlar
 
-Tizim ikki bot va bitta Telegram Mini App'dan iborat:
+Tizim ikki bot va xodimlar uchun Telegram Mini App'dan iborat:
 
 | Qism | Kim uchun | Nima qiladi |
 |---|---|---|
-| **Mijozlar boti** — @uzgroww_bot | Mijozlar | Operator yoki menejerni tanlash (rasm, lavozim, tavsif, onlayn holati bilan) va u bilan yozishish. Mijoz xodimga birinchi marta yozganda bot standart avto-javob beradi, keyin xodimning o'zi javob yozadi. |
+| **Mijozlar boti** — @uzgroww_bot | Mijozlar | Juda sodda: mijoz xodimning shaxsiy havolasi (masalan `https://t.me/uzgroww_bot?start=aziza`) orqali kirsa, hech narsa tanlamasdan darhol o'sha xodim bilan chat boshlanadi. Oddiy `/start` da operator yoki menejer tanlanadi (rasm, lavozim, tavsif, onlayn holati bilan). Mijoz xodimga birinchi marta yozganda bot standart avto-javob beradi, keyin xodimning o'zi javob yozadi. |
 | **Xodimlar boti** — @uzgrow_staff_bot | Operator, menejer, admin | Mijoz xabarlari shu botga keladi. Chatlar ro'yxati, tarix, javob berish, onlayn/oflayn holat. Admin panel orqali xodim qo'shish, tahrirlash va o'chirish. |
-| **Mini App («📱 Menyu» / «💬 Chatlar»)** | Hammaga | Telegram ichida ochiladigan ilova: xodimlarning rasmli kartochkalari, Telegram'ga o'xshash chat oynasi va admin panel. |
+| **Mini App («💬 Chatlar»)** | Xodimlar va admin | Telegram ichida ochiladigan ilova: Telegram'ga o'xshash chat oynasi, profil (shaxsiy havola bilan) va admin panel. Mijozlar uchun Mini App yo'q — ular faqat bot chatida yozadi. |
 
 **Maxfiylik.** Har bir suhbatni faqat mijoz va u tanlagan xodim ko'radi. Boshqa xodimlar ham, admin ham suhbat matnini ko'ra olmaydi.
 
 **Saqlash.** Barcha xabarlar Supabase bazasida saqlanadi.
 
-**Mijoz qaysi usulda yozishi.** Mijoz bot chatida (tugmalar orqali) ham, Mini App'da ham yozishi mumkin: ikkalasi bitta suhbat.
+**Mijoz qaysi usulda yozishi.** Faqat bot chatida. Har bir xodimning mijozlar uchun shaxsiy havolasi bor (xodim kartasida, «👤 Profilim» da va Mini App da) — uni mijozga bering.
 
 ---
 
@@ -68,7 +68,7 @@ npm run setup -- https://uzgrow-bot.vercel.app
 Bu buyruq quyidagilarni bajaradi:
 - bazani joriy sxemaga yangilaydi;
 - ikkala botning webhooklarini o'rnatadi (maxfiy token bilan);
-- bot buyruqlarini, bot tavsiflarini va «📱 Menyu» / «💬 Chatlar» Mini App tugmalarini o'rnatadi.
+- bot buyruqlarini, bot tavsiflarini va menyu tugmalarini o'rnatadi (mijozlar botida — buyruqlar ro'yxati, xodimlar botida — «💬 Chatlar» Mini App).
 
 Hammasi to'g'ri bo'lsa ikkala bot yonida ✅ chiqadi. Botlar holatini istalgan vaqtda ko'rish mumkin (bu buyruq hech narsani o'zgartirmaydi):
 
@@ -85,7 +85,8 @@ npm run setup -- --info
 1. @uzgrow_staff_bot ga `/start` yozing. Admin bo'lganingiz uchun **⚙️ Admin panel** tugmasi chiqadi.
 2. **➕ Xodim qo'shish** ni bosing va ketma-ket kiriting: rol (Operator/Menejer) → ism → lavozim → tavsif → avto-javob matni → rasm. Lavozim, tavsif, avto-javob va rasmni o'tkazib yuborish mumkin.
 3. Bot **taklif havolasi** beradi. Uni o'sha xodimga yuboring. Xodim havolani ochib **Start** bosganda uning Telegram akkaunti profilga ulanadi va u mijozlarga ko'rina boshlaydi.
-4. Xodimni istalgan vaqtda tahrirlash, rasmini almashtirish, vaqtincha o'chirib qo'yish, akkauntini uzish yoki o'chirish mumkin. Buni botda ham, Mini App dagi **⚙️ Admin** bo'limida ham qilsa bo'ladi. Xodim o'chirilsa ham suhbatlar tarixi saqlanib qoladi.
+4. Xodimning **mijozlar uchun havolasi** ismidan avtomatik yaratiladi (`?start=aziza`). Uni kartadagi «✏️ Havola nomi» tugmasi (yoki Mini App dagi «Havola nomi» maydoni) bilan o'zgartirish mumkin: 2–32 ta lotin harfi, raqam yoki `_`. Nom o'zgarsa, eski havola ishlamay qoladi.
+5. Xodimni istalgan vaqtda tahrirlash, rasmini almashtirish, vaqtincha o'chirib qo'yish, akkauntini uzish yoki o'chirish mumkin. Buni botda ham, Mini App dagi **⚙️ Admin** bo'limida ham qilsa bo'ladi. Xodim o'chirilsa ham suhbatlar tarixi saqlanib qoladi.
 
 > Mijozlarga faqat **faol** va **akkaunti ulangan** xodimlar ko'rinadi. Admin ro'yxatida ⏳ belgisi akkaunt hali ulanmaganini bildiradi.
 
@@ -94,11 +95,12 @@ npm run setup -- --info
 ## 5. Qanday ishlaydi
 
 **Mijoz:**
-- `/start` → «👨‍💻 Operatorlar» yoki «👔 Menejerlar» → xodim kartochkasi (rasm, lavozim, tavsif, ◀️ ▶️ bilan varaqlash) → **✍️ Yozish**.
+- Xodimning shaxsiy havolasi orqali kirsa — darhol o'sha xodim bilan chat boshlanadi (xodim rasmi va «Siz … bilan bog'landingiz» xabari), hech narsa tanlash shart emas.
+- Oddiy `/start` → «👨‍💻 Operatorlar» yoki «👔 Menejerlar» → xodim kartochkasi (rasm, lavozim, tavsif, ◀️ ▶️ bilan varaqlash) → **✍️ Yozish**.
 - Matn, rasm, video, fayl, ovozli xabar, stiker, joylashuv yoki kontakt yuborishi mumkin.
 - Birinchi xabariga bot bir martalik avto-javob beradi, keyin xodimning javoblari xodim ismi bilan keladi.
-- «💬 Suhbatlarim» orqali boshqa xodimga o'tadi yoki suhbat tarixini ko'radi. Xodimning xabariga **Reply** qilsa, javob aynan o'sha xodimga boradi.
-- Xuddi shu ishlarni «📱 Menyu» (Mini App) orqali ham qilish mumkin.
+- Boshqa xodimga o'tish uchun `/start`. Xodimning xabariga **Reply** qilsa (yoki «↩️ Javob berish» ni bossa), javob aynan o'sha xodimga boradi.
+- Pastki doimiy menyu va Mini App yo'q — bot iloji boricha sodda.
 
 **Xodim:**
 - Mijoz xabari @uzgrow_staff_bot ga mijoz ismi bilan keladi. Javob berishning uch yo'li bor:

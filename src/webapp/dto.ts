@@ -1,7 +1,7 @@
 // Mini App uchun JSON (DTO) ko'rinishlari. Sanalar ISO satr sifatida qaytariladi.
 import { createHash } from 'node:crypto';
 import { signMediaToken } from '../auth.js';
-import { inviteLink } from '../links.js';
+import { botUsername, inviteLink, staffClientLink } from '../links.js';
 import { isStaffAvailable } from '../repo.js';
 import type {
   Conversation,
@@ -97,6 +97,10 @@ export interface AdminStaffDTO extends StaffCardDTO {
   greeting: string | null;
   sort_order: number;
   created_at: string | null;
+  /** Mijozlar uchun qisqa havola nomi (t.me/<mijoz_boti>?start=<link_code>) */
+  link_code: string | null;
+  /** Mijozlar uchun to'liq shaxsiy havola ('' — mijozlar boti username i aniqlanmagan) */
+  client_link: string;
 }
 
 export interface StaffProfileDTO extends StaffCardDTO {
@@ -104,6 +108,10 @@ export interface StaffProfileDTO extends StaffCardDTO {
   is_active: boolean;
   linked: boolean;
   greeting: string | null;
+  /** Mijozlar uchun qisqa havola nomi */
+  link_code: string | null;
+  /** Mijozlar uchun to'liq shaxsiy havola ('' — aniqlanmagan) */
+  client_link: string;
 }
 
 /** Mijoz tomonidagi suhbat qatori (xodim ma'lumotlari bilan). */
@@ -249,8 +257,31 @@ export function staffCardDTO(s: Staff, conv?: { id: number; unread: number } | n
   };
 }
 
+/**
+ * Xodimning mijozlar uchun shaxsiy havolasi (https://t.me/<mijoz_boti>?start=<link_code>). Bot username i
+ * aniqlanmasa yoki Telegram/baza xatosi bo'lsa — '' (profil/ro'yxat baribir qaytadi).
+ */
+export async function safeClientLink(s: Pick<Staff, 'id' | 'link_code'>): Promise<string> {
+  try {
+    return await staffClientLink({ id: s.id, link_code: s.link_code ?? null });
+  } catch (e) {
+    console.error('staffClientLink xatosi:', tgErrorDescription(e));
+    return '';
+  }
+}
+
+/** Mijozlar boti username i (Mini App dagi havola prefiksi uchun). Aniqlanmasa — ''. */
+export async function safeClientBotUsername(): Promise<string> {
+  try {
+    return await botUsername('client');
+  } catch (e) {
+    console.error('botUsername(client) xatosi:', tgErrorDescription(e));
+    return '';
+  }
+}
+
 /** Xodimning o'z profili (Mini App "Profil" bo'limi). unread — barcha chatlardagi o'qilmaganlar. */
-export function staffProfileDTO(s: Staff, totalUnread: number): StaffProfileDTO {
+export async function staffProfileDTO(s: Staff, totalUnread: number): Promise<StaffProfileDTO> {
   return {
     ...staffCardDTO(s, null),
     unread: totalUnread,
@@ -258,12 +289,15 @@ export function staffProfileDTO(s: Staff, totalUnread: number): StaffProfileDTO 
     is_active: s.is_active,
     linked: s.tg_user_id != null,
     greeting: s.greeting,
+    link_code: s.link_code ?? null,
+    client_link: await safeClientLink(s),
   };
 }
 
 export async function adminStaffDTO(s: Staff): Promise<AdminStaffDTO> {
   const linked = s.tg_user_id != null;
   let link: string | null = null;
+  const clientLink = safeClientLink(s);
   if (!linked && s.invite_code) {
     try {
       link = await inviteLink(s.invite_code);
@@ -283,6 +317,8 @@ export async function adminStaffDTO(s: Staff): Promise<AdminStaffDTO> {
     greeting: s.greeting,
     sort_order: s.sort_order,
     created_at: iso(s.created_at),
+    link_code: s.link_code ?? null,
+    client_link: await clientLink,
   };
 }
 

@@ -156,6 +156,18 @@ export async function setClientBlocked(tgUserId: number, blocked: boolean): Prom
   await db()`update clients set bot_blocked = ${blocked} where tg_user_id = ${tgUserId}`;
 }
 
+/**
+ * Eski (v1) doimiy pastki menyu belgisini olib tashlash. Belgi hali bor edi — true (faqat bitta chaqiruvda:
+ * bir vaqtda kelgan update lardan faqat bittasi izoh yuboradi).
+ */
+export async function clearLegacyKeyboard(tgUserId: number): Promise<boolean> {
+  const rows = await db()`
+    update clients set legacy_keyboard = false
+    where tg_user_id = ${tgUserId} and legacy_keyboard
+    returning tg_user_id`;
+  return rows.length > 0;
+}
+
 export async function setClientActiveConversation(tgUserId: number, conversationId: number | null): Promise<void> {
   await db()`update clients set active_conversation_id = ${conversationId} where tg_user_id = ${tgUserId}`;
 }
@@ -207,15 +219,123 @@ export interface NewStaff {
 }
 
 export async function createStaff(s: NewStaff): Promise<Staff> {
+  // Qisqa havola nomi ismdan olinadi ("Aziza Karimova" → "aziza"); band bo'lsa "aziza2", "aziza3", ...
+  for (let attempt = 0; ; attempt++) {
+    const code = await freeLinkCode(s.full_name);
+    try {
+      const rows = await db()<Staff[]>`
+        insert into staff (role, full_name, position, description, greeting, photo_file_id, photo_unique_id, invite_code, link_code, sort_order)
+        values (
+          ${s.role}, ${s.full_name}, ${s.position ?? ''}, ${s.description ?? ''}, ${s.greeting ?? null},
+          ${s.photo_file_id ?? null}, ${s.photo_unique_id ?? null}, ${randomCode(20)}, ${code},
+          coalesce((select max(sort_order) + 1 from staff), 0)
+        )
+        returning *`;
+      return rows[0]!;
+    } catch (e) {
+      // Parallel yaratishda bir xil nom band bo'lib qolsa — keyingisini olamiz
+      if (isLinkCodeConflict(e) && attempt < 5) continue;
+      throw e;
+    }
+  }
+}
+
+// ───────────────────────────── Mijozlar uchun qisqa havola (link_code) ─────────────────────────────
+
+/** Havola nomi: 2–32 ta kichik lotin harfi, raqam yoki "_" (Telegram start parametri shu belgilarni qabul qiladi). */
+export const LINK_CODE_RE = /^[a-z0-9_]{2,32}$/;
+
+const CYR_TO_LAT: Record<string, string> = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'j', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l',
+  м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'x', ц: 's', ч: 'ch', ш: 'sh',
+  щ: 'sh', ъ: '', ы: 'i', ь: '', э: 'e', ю: 'yu', я: 'ya', ў: 'o', қ: 'q', ғ: 'g', ҳ: 'h',
+};
+
+/** Ismdan havola nomi asosi: birinchi so'z, lotinlashtirilgan, faqat [a-z0-9] ("Ulug'bek Saidov" → "ulugbek"). */
+export function linkCodeBase(fullName: string): string {
+  const first = (fullName ?? '').trim().split(/\s+/)[0] ?? '';
+  let s = '';
+  for (const ch of first.toLowerCase()) s += CYR_TO_LAT[ch] ?? ch;
+  s = s
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]/g, '')
+    .slice(0, 24);
+  return s.length >= 2 ? s : 'xodim';
+}
+
+/** Foydalanuvchi kiritgan nomni tekshirish uchun normallashtirish (katta harf → kichik, bo'sh joylarsiz). */
+export function normalizeLinkCode(raw: string): string {
+  return (raw ?? '').trim().toLowerCase().replace(/^@/, '');
+}
+
+/** `staff_<id>` — eski havolalar uchun band; qolgan hamma to'g'ri nom ruxsat etiladi. */
+export function isValidLinkCode(code: string): boolean {
+  return LINK_CODE_RE.test(code) && !/^staff_\d+$/.test(code);
+}
+
+function isLinkCodeConflict(e: unknown): boolean {
+  const err = e as { code?: string; constraint_name?: string } | null;
+  return err?.code === '23505' && (err.constraint_name ?? '').includes('link_code');
+}
+
+/** Ismga mos bo'sh havola nomi: "aziza", band bo'lsa "aziza2", "aziza3" ... */
+async function freeLinkCode(fullName: string, exceptId?: number): Promise<string> {
+  const base = linkCodeBase(fullName);
+  const rows = await db()<{ code: string }[]>`
+    select lower(link_code) as code from staff
+    where link_code is not null and lower(link_code) like ${base + '%'}
+      ${exceptId != null ? db()`and id <> ${exceptId}` : db()``}`;
+  const taken = new Set(rows.map((r) => r.code));
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
+/** Havola nomi bo'yicha xodim (katta-kichik harf farqsiz). O'chirilganlar qaytmaydi. */
+export async function getStaffByLinkCode(code: string): Promise<Staff | null> {
+  const c = normalizeLinkCode(code);
+  if (!LINK_CODE_RE.test(c)) return null;
   const rows = await db()<Staff[]>`
-    insert into staff (role, full_name, position, description, greeting, photo_file_id, photo_unique_id, invite_code, sort_order)
-    values (
-      ${s.role}, ${s.full_name}, ${s.position ?? ''}, ${s.description ?? ''}, ${s.greeting ?? null},
-      ${s.photo_file_id ?? null}, ${s.photo_unique_id ?? null}, ${randomCode(20)},
-      coalesce((select max(sort_order) + 1 from staff), 0)
-    )
-    returning *`;
-  return rows[0]!;
+    select * from staff where lower(link_code) = ${c} and deleted_at is null`;
+  return rows[0] ?? null;
+}
+
+export type SetLinkCodeResult = { ok: true; staff: Staff } | { ok: false; reason: 'invalid' | 'taken' | 'not_found' };
+
+/** Admin havola nomini o'zgartiradi. */
+export async function setStaffLinkCode(id: number, raw: string): Promise<SetLinkCodeResult> {
+  const code = normalizeLinkCode(raw);
+  if (!isValidLinkCode(code)) return { ok: false, reason: 'invalid' };
+  try {
+    const rows = await db()<Staff[]>`
+      update staff set link_code = ${code}, updated_at = now()
+      where id = ${id} and deleted_at is null
+      returning *`;
+    return rows[0] ? { ok: true, staff: rows[0] } : { ok: false, reason: 'not_found' };
+  } catch (e) {
+    if (isLinkCodeConflict(e)) return { ok: false, reason: 'taken' };
+    throw e;
+  }
+}
+
+/** Migratsiyadan keyin: havola nomi yo'q (eski) xodimlarga ismidan nom berish. */
+export async function ensureLinkCodes(): Promise<void> {
+  const missing = await db()<Pick<Staff, 'id' | 'full_name'>[]>`
+    select id, full_name from staff where link_code is null and deleted_at is null order by id`;
+  for (const s of missing) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = await freeLinkCode(s.full_name, s.id);
+      try {
+        await db()`update staff set link_code = ${code} where id = ${s.id} and link_code is null`;
+        break;
+      } catch (e) {
+        if (!isLinkCodeConflict(e)) throw e;
+      }
+    }
+  }
 }
 
 export type StaffEditableField =
@@ -380,7 +500,7 @@ export async function softDeleteStaff(id: number): Promise<boolean> {
   const sql = db();
   const rows = await sql`
     update staff set deleted_at = now(), is_active = false, tg_user_id = null, tg_username = null,
-      invite_code = null, active_conversation_id = null, updated_at = now()
+      invite_code = null, link_code = null, active_conversation_id = null, updated_at = now()
     where id = ${id} and deleted_at is null
     returning id`;
   if (rows.length) {

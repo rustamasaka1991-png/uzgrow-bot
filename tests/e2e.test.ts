@@ -52,6 +52,13 @@ const C4: TUser = { id: 5004, is_bot: false, first_name: 'Nilufar', username: 'n
 const OP3: TUser = { id: 7004, is_bot: false, first_name: 'Nodira' };
 /** Avto-javob Telegram 5xx da yuborilmay qolganini tekshirish uchun (hali hech kimga yozmagan) yangi mijoz. */
 const C5: TUser = { id: 5005, is_bot: false, first_name: 'Olim' };
+/** Salomlashuv sozlamasini tekshirish uchun — faol suhbati yo'q mijoz (HTML belgilar bilan ism). */
+const C6: TUser = { id: 5006, is_bot: false, first_name: 'Lola <3' };
+/** Xodimning shaxsiy havolasi (/start <nom>) orqali kiradigan yangi mijozlar. */
+const C7: TUser = { id: 5007, is_bot: false, first_name: 'Kamola', username: 'kamola_k' };
+const C8: TUser = { id: 5008, is_bot: false, first_name: 'Jasur' };
+/** Mijozlar Mini App i o'chirilgan: bazada yo'q mijoz bootstrap qilsa ham yozuv yaratilmasligi kerak. */
+const C9: TUser = { id: 5009, is_bot: false, first_name: 'Yangi' };
 
 const AZIZA_JPEG = fakeJpeg({ width: 800, height: 800, size: 6000, seed: 11 });
 const SARDOR_JPEG = fakeJpeg({ width: 640, height: 640, size: 5000, seed: 22 });
@@ -108,6 +115,7 @@ const mediaApi = (await import('../api/media.js')).default;
 const setupApi = (await import('../api/setup.js')).default;
 const guards = await import('../src/webapp/guards.js');
 const util = await import('../src/util.js');
+const { SCHEMA_VERSION } = await import('../src/schema.js');
 
 const sql = db();
 
@@ -400,7 +408,7 @@ async function countMessages(convId: number, sender?: string): Promise<number> {
 // ───────────────────────────── Test holati ─────────────────────────────
 
 const ids = { aziza: 0, bobur: 0, sardor: 0, adminMgr: 0 };
-const convs = { c1aziza: 0, c2aziza: 0, c1bobur: 0, c3aziza: 0, c2sardor: 0, c3admin: 0 };
+const convs = { c1aziza: 0, c2aziza: 0, c1bobur: 0, c3aziza: 0, c2sardor: 0, c3admin: 0, c7aziza: 0, c7bobur: 0 };
 const invites = { aziza: '', bobur: '', sardor: '', adminMgr: '' };
 /** Xodim chatidagi (staff bot) relay qilingan mijoz xabarlari id lari. */
 const relayed = { c1first: 0, c1second: 0, c2first: 0, c1photo: 0, c3admin: 0 };
@@ -413,6 +421,87 @@ let uploadedPhotoUrl = '';
 
 const HEADER_C1 = '👤 Ali Valiyev';
 const HEADER_AZIZA = '👨‍💻 Aziza Karimova';
+
+// ── Mijozlar boti v2: shaxsiy havolalar, sodda /start, mijozlar uchun Mini App yo'q ──
+const CLIENT_BOT_LINK = 'https://t.me/uzgroww_bot?start=';
+const LINK_NOT_FOUND = "⚠️ Bu havola bo'yicha xodim topilmadi yoki u hozir ishlamayapti.";
+const CLIENT_APP_DISABLED = 'Bu ilova faqat xodimlar uchun. Iltimos, bot chatiga qayting va shu yerda yozing.';
+const OFFLINE_LINE = '🕐 Hozir oflayn — imkon qadar tezroq javob beradi.';
+const LINK_HINT = 'Shu havolani mijozlaringizga bering — ular kirishi bilan siz bilan chat boshlanadi.';
+const HELP_TEXT =
+  'ℹ️ Botdan qanday foydalaniladi?\n\n' +
+  "✍️ Savolingizni shu chatga yozing — matn, rasm, fayl yoki ovozli xabar bo'lishi mumkin.\n" +
+  '💬 Xodimning javobi ham shu yerga keladi.\n' +
+  '🔄 Boshqa xodim tanlash uchun: /start';
+const UNKNOWN_COMMAND_TEXT =
+  "🤔 Bunday buyruq yo'q — xabaringiz xodimga yuborilmadi.\n\n" +
+  '✍️ Savolingizni oddiy xabar qilib yozing.\n' +
+  '/start — xodim tanlash\n' +
+  '/help — yordam';
+/** v1 dagi standart salomlashuv (sozlamada qolgan bo'lsa — mijozga yangi qisqa standart matn ko'rsatiladi). */
+const LEGACY_DEFAULT_WELCOME =
+  'Assalomu alaykum, {name}! 👋\n\n' +
+  "Botimizga xush kelibsiz. Bu yerda siz o'zingizga kerakli operator yoki menejerni tanlab, " +
+  "u bilan to'g'ridan-to'g'ri yozishishingiz mumkin.\n\n" +
+  '👨‍💻 Operatorlar — savollar va texnik yordam\n' +
+  '👔 Menejerlar — buyurtma, hamkorlik va takliflar\n\n' +
+  '👇 Pastdagi tugmalardan tanlang yoki «📱 Menyu» ni oching.';
+
+function clientLink(code: string): string {
+  return `${CLIENT_BOT_LINK}${code}`;
+}
+
+/** Mijozlar havolasini ulashish (t.me/share) havolasi. */
+function shareUrlFor(link: string): string {
+  return `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("Men bilan shu havola orqali bog'laning")}`;
+}
+
+/** Standart salomlashuv (oddiy /start, faol suhbat yo'q). */
+function welcomeFor(name: string): string {
+  return texts.fill(texts.DEFAULT_WELCOME, { name });
+}
+
+/** Shaxsiy havola orqali kirgandagi yagona xabar izohi (oddiy matn ko'rinishi). */
+function linkCaption(o: {
+  client: string;
+  staff: string;
+  role: string;
+  existing?: boolean;
+  offline?: boolean;
+  last?: string;
+}): string {
+  const lines = [
+    o.client ? `👋 Assalomu alaykum, ${o.client}!` : '👋 Assalomu alaykum!',
+    '',
+    o.existing ? `Siz yana ${o.staff} bilan suhbatdasiz.` : `Siz ${o.staff} bilan bog'landingiz.`,
+    o.role,
+  ];
+  if (o.offline) lines.push(OFFLINE_LINE);
+  lines.push('', o.last ?? '✍️ Savolingizni shu yerga yozing.');
+  return lines.join('\n');
+}
+
+/** Xabarning inline klaviaturasi — aynan bitta qator [👨‍💻 Operatorlar ls:operator] [👔 Menejerlar ls:manager]. */
+function isRoleRowOnly(m: ChatMessage | undefined): boolean {
+  const rows = (m?.markup?.inline_keyboard ?? []) as Array<Array<{ text?: string; callback_data?: string }>>;
+  const flat = JSON.stringify(rows.map((r) => r.map((b) => [b.text, b.callback_data])));
+  return (
+    flat === JSON.stringify([[['👨‍💻 Operatorlar', 'ls:operator'], ['👔 Menejerlar', 'ls:manager']]]) &&
+    m?.markup?.keyboard === undefined &&
+    !JSON.stringify(m?.markup ?? {}).includes('web_app')
+  );
+}
+
+/** Havola orqali kirish / «✍️ Yozish» xabari: faqat eski klaviaturani olib tashlash, inline tugmalarsiz. */
+function isRemoveKeyboardOnly(m: ChatMessage | undefined): boolean {
+  return JSON.stringify(m?.markup) === JSON.stringify({ remove_keyboard: true }) && m?.buttons.length === 0;
+}
+
+/** Matndagi `name` qalin (bold) yozilganmi. */
+function boldName(m: ChatMessage | undefined, name: string): boolean {
+  const at = m?.text.indexOf(name) ?? -1;
+  return at >= 0 && hasBold(m, at, name.length);
+}
 
 function inviteCodeFrom(text: string): string {
   const m = /start=inv_([A-Za-z0-9]+)/.exec(text);
@@ -575,7 +664,8 @@ async function unitTests(): Promise<void> {
 }
 
 async function setupTests(): Promise<void> {
-  await step('setup: runSetup — webhook, buyruqlar (admin scope), Mini App menyu tugmasi', async () => {
+  await step("setup: runSetup — webhook, buyruqlar (admin scope), menyu tugmalari (mijoz — buyruqlar, xodim — Mini App)", async () => {
+    const setupStart = tg.calls.length;
     const report = await runSetup(ORIGIN);
     ok(report.bots.client?.ok, `client setup: ${report.bots.client?.error}`);
     ok(report.bots.staff?.ok, `staff setup: ${report.bots.staff?.error}`);
@@ -586,10 +676,27 @@ async function setupTests(): Promise<void> {
     ok(tg.webhook(STAFF)?.secret_token !== wc?.secret_token, 'botlar secret lari har xil bo\'lishi kerak');
     const staffCmds = tg.commands(STAFF).map((c: any) => c.command);
     ok(staffCmds.includes('chats') && !staffCmds.includes('admin'), `umumiy xodim buyruqlari: ${staffCmds}`);
-    ok(tg.commands(CLIENT).some((c: any) => c.command === 'operators'), 'mijoz buyruqlari');
+    // Mijozlar boti sodda: faqat /start va /help; Mini App yo'q — menyu tugmasi buyruqlar ro'yxati
+    eq(
+      JSON.stringify(tg.commands(CLIENT).map((c: any) => [c.command, c.description])),
+      JSON.stringify([['start', '🔄 Boshlash / xodim tanlash'], ['help', 'ℹ️ Yordam']]),
+      'mijoz buyruqlari',
+    );
+    const mbCall = callsSince(setupStart, CLIENT, 'setChatMenuButton')[0];
+    ok(mbCall?.ok, 'mijoz menyu tugmasi aniq o\'rnatildi');
+    const mbParam = mbCall!.params.menu_button;
+    eq(
+      JSON.stringify(typeof mbParam === 'string' ? JSON.parse(mbParam) : mbParam),
+      JSON.stringify({ type: 'commands' }),
+      'mijoz menyu tugmasi — buyruqlar',
+    );
     const mb = tg.menuButton(CLIENT);
-    eq(mb.type, 'web_app', 'menyu tugmasi turi');
-    eq(mb.web_app?.url, `${ORIGIN}/app/`, 'Mini App manzili');
+    eq(mb.type, 'commands', 'mijoz menyu tugmasi turi');
+    eq(mb.web_app, undefined, "mijozlarda Mini App yo'q");
+    const smb = tg.menuButton(STAFF);
+    eq(smb.type, 'web_app', 'xodim menyu tugmasi turi');
+    eq(smb.text, '💬 Chatlar', 'xodim menyu tugmasi matni');
+    eq(smb.web_app?.url, `${ORIGIN}/app/`, 'Mini App manzili (xodimlar)');
     const saved = (await sql`select value from settings where key = 'app_url'`)[0];
     eq(saved?.value, ORIGIN, 'app_url sozlamasi');
   }, {
@@ -765,11 +872,18 @@ async function adminFlowTests(): Promise<void> {
     includes(card?.text, "Yangi xodim qo'shildi", 'bildirishnoma');
     invites.aziza = inviteCodeFrom(card!.text);
     includes(card?.text, `https://t.me/uzgrow_staff_bot?start=inv_${invites.aziza}`, 'taklif havolasi');
+    includes(card?.text, "📨 Taklif havolasi — xodimning o'ziga", 'taklif havolasi sarlavhasi (mijozlar havolasidan farqli)');
     ok(findButton(card, /Havolani ulashish/), 'ulashish tugmasi');
+    // Mijozlar uchun shaxsiy havola: ismdan avtomatik nom ("Aziza Karimova" → aziza), akkaunt hali ulanmagan
+    includes(card?.text, 'Mijozlar uchun havolasi ham tayyor', "bildirishnomada mijozlar havolasi haqida");
+    includes(card?.text, `🔗 Mijozlar uchun havola: ${clientLink('aziza')} (akkaunt ulangandan keyin ishlaydi)`, 'mijozlar havolasi');
 
     const row = (await sql`select * from staff where full_name = 'Aziza Karimova'`)[0];
     ok(row, 'bazada xodim');
     ids.aziza = row.id;
+    eq(row.link_code, 'aziza', 'havola nomi ismdan');
+    eq(findButton(card, `adm:e:${ids.aziza}:link_code`)?.text, '✏️ Havola nomi', '«✏️ Havola nomi» tugmasi');
+    eq(findButton(card, /Mijozlarga ulashish/)?.url, shareUrlFor(clientLink('aziza')), 'mijozlar havolasini ulashish tugmasi');
     eq(row.role, 'operator', 'rol');
     eq(row.position, 'Katta operator', 'lavozim');
     eq(row.description, "Buyurtma <b>va</b> to'lov & yetkazish", 'tavsif xom holda saqlanadi');
@@ -801,6 +915,8 @@ async function adminFlowTests(): Promise<void> {
     eq(row.position, '', "lavozim bo'sh");
     eq(row.greeting, 'Salom {name}! Men {staff}, tez orada javob beraman.', 'shaxsiy avto-javob');
     eq(row.photo_file_id, null, "rasm yo'q");
+    eq(row.link_code, 'bobur', 'havola nomi ismdan');
+    includes(card?.text, `🔗 Mijozlar uchun havola: ${clientLink('bobur')} (akkaunt ulangandan keyin ishlaydi)`, 'kartada mijozlar havolasi');
   });
 
   await step('admin (Mini App): xodim yaratish, validatsiya, rasm yuklash, ro\'yxat', async () => {
@@ -820,6 +936,9 @@ async function adminFlowTests(): Promise<void> {
     ok(typeof r.staff.invite_link === 'string' && r.staff.invite_link.startsWith('https://t.me/uzgrow_staff_bot?start=inv_'), `invite_link: ${r.staff.invite_link}`);
     invites.sardor = inviteCodeFrom(r.staff.invite_link);
     eq(r.staff.linked, false, 'linked');
+    eq(r.staff.link_code, 'sardor', 'link_code (ismdan)');
+    eq(r.staff.client_link, clientLink('sardor'), 'client_link');
+    eq(r.warning, undefined, "havola nomi berilmagan — ogohlantirish yo'q");
 
     const before = callsSince(0, STAFF, 'sendPhoto').length;
     const p = expectApi(
@@ -841,6 +960,12 @@ async function adminFlowTests(): Promise<void> {
     const list = expectApi(await app('staff', ADMIN, 'admin.staff.list'), 200, 'admin.staff.list');
     eq(list.staff.length, 3, 'xodimlar soni');
     ok(list.staff.every((s: any) => s.linked === false && typeof s.invite_link === 'string'), 'hammasi ulanmagan, havola bor');
+    eq(list.client_bot, 'uzgroww_bot', 'client_bot (havola prefiksi uchun)');
+    eq(
+      JSON.stringify(list.staff.map((s: any) => [s.link_code, s.client_link]).sort()),
+      JSON.stringify(['aziza', 'bobur', 'sardor'].map((c) => [c, clientLink(c)])),
+      'har bir xodimda link_code va client_link',
+    );
   });
 
   await step('admin (bot): xodim rasmini rasm-fayl (hujjat) sifatida almashtirish — rasm sifatida qayta yuklanadi', async () => {
@@ -876,6 +1001,10 @@ async function adminFlowTests(): Promise<void> {
     const linked = botMsgsSince('staff', OP1.id, opBefore);
     includes(linked[0]?.text, 'Tabriklaymiz', 'ulash xabari');
     includes(linked[0]?.text, 'Aziza Karimova', 'profil nomi');
+    // Mijozlar uchun shaxsiy havola va bir qatorli izoh (nusxalash/ulashish — «👤 Profilim» da)
+    includes(linked[0]?.text, `🔗 Mijozlar uchun havolangiz:\n${clientLink('aziza')}\n${LINK_HINT}`, 'ulash xabarida mijozlar havolasi');
+    includes(linked[0]?.text, '📋 Nusxalash va ulashish — «👤 Profilim» da.', 'profilga ishora');
+    ok(!linked[0]!.buttons.some((b) => b.callback_data), "ulash xabarida inline tugma yo'q");
     ok(linked[1]?.buttons.some((b) => b.web_app?.url === `${ORIGIN}/app/`), 'Mini App tugmasi (📱 Chatlarni ochish)');
     includes(JSON.stringify(tg.keyboard(STAFF, OP1.id)), '💬 Chatlar', 'xodim klaviaturasi');
     excludes(JSON.stringify(tg.keyboard(STAFF, OP1.id)), 'Admin panel', 'oddiy xodimda admin tugmasi yo\'q');
@@ -900,43 +1029,171 @@ async function adminFlowTests(): Promise<void> {
     eq((await staffRow(ids.bobur)).tg_user_id, MGR.id, 'Bobur tg_user_id');
     eq((await staffRow(ids.sardor)).tg_user_id, OP2.id, 'Sardor tg_user_id');
   });
+
+  await step("admin (bot): mijozlar havolasi nomini o'zgartirish — noto'g'ri / band nom qayta so'raladi, to'liq havola qabul qilinadi, xodim xabardor qilinadi", async () => {
+    await say('staff', ADMIN, '/admin');
+    const home = lastBot('staff', ADMIN.id)!;
+    await press('staff', ADMIN, home, 'adm:list');
+    await press('staff', ADMIN, tg.message(STAFF, ADMIN.id, home.id), `adm:s:${ids.aziza}`);
+    const card = lastBot('staff', ADMIN.id);
+    includes(card?.text, `🔗 Mijozlar uchun havola: ${clientLink('aziza')}`, 'ulangan xodim kartasida mijozlar havolasi');
+    excludes(card?.text, 'akkaunt ulangandan keyin', 'ulangan va faol — izohsiz');
+    eq(findButton(card, /Mijozlarga ulashish/)?.url, shareUrlFor(clientLink('aziza')), 'ulashish tugmasi');
+
+    await press('staff', ADMIN, card, `adm:e:${ids.aziza}:link_code`);
+    const prompt = lastBot('staff', ADMIN.id);
+    includes(prompt?.text, "havola nomini o'zgartirish", "so'rov sarlavhasi");
+    includes(prompt?.text, 'Hozirgi nom: aziza', 'hozirgi nom');
+    includes(prompt?.text, `Havola: ${clientLink('aziza')}`, 'hozirgi havola');
+    includes(prompt?.text, '✍️ Yangi nomni yuboring: 2–32 ta lotin harfi, raqam yoki _; masalan: aziza', 'qoidalar');
+    includes(prompt?.text, "⚠️ Nom o'zgarsa, eski havola ishlamay qoladi.", 'ogohlantirish');
+    ok(findButton(prompt, 'adm:cancel'), '✖️ Bekor qilish');
+
+    const opMark = mark('staff', OP1.id);
+    // Noto'g'ri nomlar: qoida bilan qayta so'raladi, holat saqlanadi, bazada o'zgarish yo'q
+    let lastPrompt = prompt!;
+    for (const bad of ['Bad Name!', 'a', 'staff_12', 'Азиза', 'x'.repeat(33)]) {
+      const b = mark('staff', ADMIN.id);
+      await say('staff', ADMIN, bad);
+      const re = botMsgsSince('staff', ADMIN.id, b);
+      eq(re.length, 1, `${bad}: bitta qayta so'rov`);
+      includes(re[0]!.text, "❌ Bu nom to'g'ri emas — 2–32 ta lotin harfi, raqam yoki _; masalan: aziza", `${bad}: xato matni`);
+      eq(tg.message(STAFF, ADMIN.id, lastPrompt.id)!.buttons.length, 0, `${bad}: eski so'rov tugmalari olib tashlandi`);
+      lastPrompt = re[0]!;
+    }
+    await say('staff', ADMIN, { photo: tg.photo(STAFF, fakeJpeg({ seed: 71 })) });
+    includes(lastBot('staff', ADMIN.id)?.text, "❌ Iltimos, nomni matn ko'rinishida yuboring", 'rasm — matn so\'raladi');
+    eq((await staffRow(ids.aziza)).link_code, 'aziza', "noto'g'ri kiritishlardan keyin o'zgarmadi");
+    eq((await sql`select count(*)::int as n from user_state where bot = 'staff'`)[0]!.n, 1, 'holat saqlanib turibdi');
+
+    // Band nom (katta-kichik harf farqsiz) — holat saqlanadi, keyingi matn yana havola nomi sifatida olinadi
+    await say('staff', ADMIN, 'BOBUR');
+    includes(lastBot('staff', ADMIN.id)?.text, '❌ Bu nom band, boshqasini yozing', 'band nom');
+    eq((await staffRow(ids.aziza)).link_code, 'aziza', "band nom saqlanmadi");
+    eq((await sql`select count(*)::int as n from user_state where bot = 'staff'`)[0]!.n, 1, 'holat saqlandi (band)');
+
+    // To'g'ri nom — normallashtiriladi, yangi karta, xodim yangi havola haqida xabardor qilinadi
+    let b = mark('staff', ADMIN.id);
+    await say('staff', ADMIN, 'Aziza_Op');
+    eq((await staffRow(ids.aziza)).link_code, 'aziza_op', 'kichik harflarda saqlandi');
+    eq((await sql`select count(*)::int as n from user_state where bot = 'staff'`)[0]!.n, 0, 'holat tozalandi');
+    const saved = botMsgsSince('staff', ADMIN.id, b).pop();
+    includes(saved?.text, '✅ Havola nomi saqlandi. Eski havola endi ishlamaydi.', 'saqlandi');
+    includes(saved?.text, clientLink('aziza_op'), 'kartada yangi havola');
+    let note = botMsgsSince('staff', OP1.id, opMark);
+    eq(note.length, 1, 'xodimga bitta xabarnoma');
+    includes(note[0]!.text, `🔗 Admin mijozlar uchun havolangizni o'zgartirdi:\n${clientLink('aziza_op')}`, 'xabarnoma: yangi havola');
+    includes(note[0]!.text, 'Eski havola endi ishlamaydi — mijozlaringizga yangisini bering.', 'xabarnoma: eski havola');
+
+    // To'liq havola yuborilsa — nom ajratib olinadi (katta harf ham)
+    await press('staff', ADMIN, saved, `adm:e:${ids.aziza}:link_code`);
+    b = mark('staff', ADMIN.id);
+    await say('staff', ADMIN, 'https://t.me/uzgroww_bot?start=Aziza');
+    eq((await staffRow(ids.aziza)).link_code, 'aziza', "to'liq havoladan nom olindi");
+    includes(botMsgsSince('staff', ADMIN.id, b).pop()?.text, 'Havola nomi saqlandi', 'saqlandi (2)');
+    note = botMsgsSince('staff', OP1.id, opMark);
+    eq(note.length, 2, 'xodimga ikkinchi xabarnoma');
+    includes(note[1]!.text, clientLink('aziza'), 'xabarnomada tiklangan havola');
+
+    // Xuddi shu nom — «✅ Saqlandi.», xodimga xabarnoma yo'q
+    await press('staff', ADMIN, lastBot('staff', ADMIN.id), `adm:e:${ids.aziza}:link_code`);
+    b = mark('staff', ADMIN.id);
+    await say('staff', ADMIN, 'AZIZA');
+    includes(botMsgsSince('staff', ADMIN.id, b).pop()?.text, '✅ Saqlandi.', "o'zgarmagan nom");
+    eq(botMsgsSince('staff', OP1.id, opMark).length, 2, "o'zgarmagan nom — xabarnoma yo'q");
+
+    // Bekor qilish — karta qaytadi, holat tozalanadi
+    await press('staff', ADMIN, lastBot('staff', ADMIN.id), `adm:e:${ids.aziza}:link_code`);
+    await press('staff', ADMIN, lastBot('staff', ADMIN.id), 'adm:cancel');
+    includes(lastBot('staff', ADMIN.id)?.text, 'Aziza Karimova', 'bekor qilish — karta');
+    eq((await sql`select count(*)::int as n from user_state where bot = 'staff'`)[0]!.n, 0, 'holat tozalandi (bekor)');
+
+    // Admin yordami mijozlar havolasini tushuntiradi
+    await say('staff', ADMIN, '/help');
+    includes(lastBot('staff', ADMIN.id)?.text, 'mijozlar uchun shaxsiy havolasi', 'admin yordami');
+    includes(lastBot('staff', ADMIN.id)?.text, '«✏️ Havola nomi»', 'admin yordami (tugma)');
+  });
+
+  await step("migratsiya: havola nomi yo'q eski xodimlarga ismidan nom beriladi (band — raqam bilan, kirill, tutuq, emoji), o'chirilganlarga — yo'q", async () => {
+    const legacy = ['Aziza Eski', 'Азиза Кириллча', "Ulug'bek Saidov", '🌟 Yulduz'];
+    const allNames = [...legacy, 'Eski Ochirilgan'];
+    try {
+      // v1 dagi kabi: link_code ustunisiz yaratilgan xodimlar (createStaff emas — nom berilmagan)
+      await sql`
+        insert into staff (role, full_name)
+        values ('operator', ${legacy[0]!}), ('operator', ${legacy[1]!}), ('manager', ${legacy[2]!}), ('operator', ${legacy[3]!})`;
+      await sql`insert into staff (role, full_name, is_active, deleted_at) values ('operator', 'Eski Ochirilgan', false, now())`;
+      const before = await sql`select link_code from staff where full_name = any(${sql.array(allNames)}::text[])`;
+      ok(before.length === 5 && before.every((r: any) => r.link_code === null), 'boshida havola nomi yo\'q');
+      await sql`update settings set value = 'eski' where key = 'schema_version'`;
+
+      await migrate();
+
+      const rows = await sql`select full_name, link_code from staff where full_name = any(${sql.array(legacy)}::text[]) order by id`;
+      eq(
+        JSON.stringify(rows.map((r: any) => r.link_code)),
+        JSON.stringify(['aziza2', 'aziza3', 'ulugbek', 'xodim']),
+        "berilgan nomlar (aziza band — aziza2, kirill — lotinlashtirildi, tutuq olib tashlandi, emoji — xodim)",
+      );
+      eq((await sql`select link_code from staff where full_name = 'Eski Ochirilgan'`)[0]?.link_code, null, "o'chirilgan xodimga nom berilmadi");
+      eq((await sql`select value from settings where key = 'schema_version'`)[0]?.value, SCHEMA_VERSION, 'sxema versiyasi yozildi');
+      // Mavjud xodimlarning nomlari o'zgarmadi
+      eq((await staffRow(ids.aziza)).link_code, 'aziza', "mavjud nom o'zgarmadi");
+      eq((await staffRow(ids.bobur)).link_code, 'bobur', "mavjud nom o'zgarmadi (bobur)");
+    } finally {
+      await sql`delete from staff where full_name = any(${sql.array(allNames)}::text[])`;
+    }
+  });
 }
 
 async function clientBotTests(): Promise<void> {
-  await step('mijoz: /start — salomlashuv, doimiy klaviatura, Mini App tugmasi', async () => {
+  await step("mijoz: /start — BITTA xabar (qisqa salomlashuv + [Operatorlar] [Menejerlar]), doimiy klaviatura va Mini App yo'q", async () => {
     const before = mark('client', C1.id);
     await say('client', C1, '/start');
     const msgs = botMsgsSince('client', C1.id, before);
-    eq(msgs.length, 2, 'ikkita xabar');
-    ok(msgs[0]!.text.startsWith('Assalomu alaykum, Ali! 👋'), `salomlashuv: ${msgs[0]!.text.slice(0, 60)}`);
-    const kb = tg.keyboard(CLIENT, C1.id);
-    const labels = (kb?.keyboard ?? []).map((row: any[]) => row.map((b) => (typeof b === 'string' ? b : b.text)));
-    eq(JSON.stringify(labels), JSON.stringify([['👨‍💻 Operatorlar', '👔 Menejerlar'], ['💬 Suhbatlarim', 'ℹ️ Yordam']]), 'klaviatura');
-    ok(kb.resize_keyboard === true && kb.is_persistent === true, 'resized + persistent');
-    const menu = msgs[1]!;
-    const web = menu.buttons.find((b) => b.web_app);
-    eq(web?.web_app?.url, `${ORIGIN}/app/`, 'web_app tugmasi');
-    ok(findButton(menu, 'ls:operator') && findButton(menu, 'ls:manager'), 'rol tugmalari');
+    eq(msgs.length, 1, 'bitta xabar');
+    eq(msgs[0]!.text, "Assalomu alaykum, Ali! 👋\n\nKim bilan bog'lanmoqchisiz? Quyidan tanlang 👇", 'salomlashuv');
+    eq(msgs[0]!.text, welcomeFor('Ali'), 'DEFAULT_WELCOME');
+    ok(isRoleRowOnly(msgs[0]), `faqat rol tugmalari: ${JSON.stringify(msgs[0]!.markup)}`);
+    ok(!msgs[0]!.buttons.some((b) => b.web_app), "web_app tugmasi yo'q");
+    eq(tg.keyboard(CLIENT, C1.id), null, "doimiy (reply) klaviatura yuborilmadi");
     const row = await clientRow(C1.id);
     eq(row?.first_name, 'Ali', 'mijoz bazada');
     eq(row?.username, 'ali_v', 'username');
+    eq(row?.legacy_keyboard, false, "yangi mijozda eski menyu belgisi yo'q");
   });
 
   await step('mijoz: /help, /menu, noma\'lum buyruq, guruh chatlari e\'tiborsiz', async () => {
     let before = mark('client', C1.id);
     await say('client', C1, '/help');
-    includes(textsSince('client', C1.id, before), 'Botdan qanday foydalaniladi', 'yordam');
+    const help = botMsgsSince('client', C1.id, before);
+    eq(help.length, 1, 'bitta yordam xabari');
+    eq(help[0]!.text, HELP_TEXT, 'qisqa yordam');
+    includes(help[0]!.text, 'Botdan qanday foydalaniladi', 'yordam');
+    ok(isRemoveKeyboardOnly(help[0]), `yordam — klaviaturasiz (remove_keyboard): ${JSON.stringify(help[0]!.markup)}`);
     before = mark('client', C1.id);
     await say('client', C1, 'ℹ️ Yordam');
-    includes(textsSince('client', C1.id, before), 'Botdan qanday foydalaniladi', 'yordam tugmasi');
+    includes(textsSince('client', C1.id, before), 'Botdan qanday foydalaniladi', 'eski «ℹ️ Yordam» tugmasi ham ishlaydi');
     before = mark('client', C1.id);
     await say('client', C1, '/menu');
-    const menu = botMsgsSince('client', C1.id, before)[0];
-    includes(menu?.text, 'Asosiy menyu', 'menyu');
-    ok(findButton(menu, 'chats') && findButton(menu, 'ls:operator'), 'menyu tugmalari');
+    const menuMsgs = botMsgsSince('client', C1.id, before);
+    eq(menuMsgs.length, 1, '/menu — bitta xabar');
+    const menu = menuMsgs[0];
+    eq(menu?.text, welcomeFor('Ali'), '/menu — /start bilan bir xil');
+    excludes(menu?.text, 'Asosiy menyu', "eski «Asosiy menyu» yo'q");
+    ok(isRoleRowOnly(menu), `/menu tugmalari: ${JSON.stringify(menu?.markup)}`);
+    ok(!findButton(menu, 'chats'), "«💬 Suhbatlarim» tugmasi yo'q");
     before = mark('client', C1.id);
+    const cmdStart = tg.calls.length;
+    const cmdMsgs = (await sql`select count(*)::int as n from messages`)[0]!.n;
     await say('client', C1, '/foo bar');
-    includes(textsSince('client', C1.id, before), "Bunday buyruq yo'q", "noma'lum buyruq");
+    const cmd = botMsgsSince('client', C1.id, before);
+    eq(cmd.length, 1, "noma'lum buyruq — bitta javob");
+    eq(cmd[0]!.text, UNKNOWN_COMMAND_TEXT, "noma'lum buyruq matni");
+    eq(cmd[0]!.markup, undefined, "noma'lum buyruq — tugmasiz");
+    eq(callsSince(cmdStart, STAFF).length, 0, 'buyruq xodimga yuborilmadi');
+    eq((await sql`select count(*)::int as n from messages`)[0]!.n, cmdMsgs, 'buyruq saqlanmadi');
+    eq((await sql`select count(*)::int as n from user_state where bot = 'client' and tg_user_id = ${C1.id}`)[0]!.n, 0, 'buyruq saqlab qo\'yilmadi');
     before = mark('client', C1.id);
     await say('client', C1, 'Hali hech kimni tanlamadim');
     const chooseText = textsSince('client', C1.id, before);
@@ -968,7 +1225,7 @@ async function clientBotTests(): Promise<void> {
     includes(list?.text, 'Sardor Qodirov', 'Sardor');
     excludes(list?.text, 'Bobur', 'menejer operatorlar ro\'yxatida emas');
     ok(findButton(list, `card:${ids.aziza}`) && findButton(list, `card:${ids.sardor}`), 'karta tugmalari');
-    ok(list!.buttons.some((b) => b.web_app), "Menyuda ko'rish (web_app)");
+    ok(!list!.buttons.some((b) => b.web_app), "«📱 Menyuda ko'rish» (web_app) tugmasi yo'q");
     // ls:<role> callback (asosiy menyu tugmasi) shu xabarning o'zida tahrirlanadi
     await forge('client', C1, list!, 'ls:manager');
     const edited = tg.message(CLIENT, C1.id, list!.id);
@@ -1073,12 +1330,17 @@ async function clientBotTests(): Promise<void> {
     includes(fresh[0]!.text, 'Aziza Karimova', 'yangi kartada keyingi xodim');
   }, { allowFailedCalls: (c) => c.method === 'editMessageMedia' });
 
-  await step('mijoz: «✍️ Yozish» — suhbat yaratiladi va aktiv bo\'ladi', async () => {
+  await step("mijoz: «✍️ Yozish» — suhbat yaratiladi va aktiv bo'ladi; tasdiq qisqa, tugmasiz, eski klaviatura olib tashlanadi", async () => {
     const card = lastBot('client', C1.id);
+    const before = mark('client', C1.id);
     const q = await press('client', C1, card, `pick:${ids.aziza}`);
     eq(answerOf(q).text, '✅ Tanlandi', 'callback javobi');
-    const m = lastBot('client', C1.id);
-    includes(m?.text, "Siz endi Aziza Karimova (Operator) bilan bog'landingiz", 'tanlash xabari');
+    const got = botMsgsSince('client', C1.id, before);
+    eq(got.length, 1, 'bitta tasdiq xabari');
+    const m = got[0];
+    eq(m?.text, "✅ Siz Aziza Karimova (Operator) bilan bog'landingiz.\n✍️ Savolingizni yozing.", 'tanlash xabari');
+    ok(boldName(m, 'Aziza Karimova'), 'xodim ismi qalin');
+    ok(isRemoveKeyboardOnly(m), `remove_keyboard, inline tugmasiz («📜 Suhbat tarixi» yo'q): ${JSON.stringify(m?.markup)}`);
     const conv = await convOf(C1.id, ids.aziza);
     ok(conv, 'suhbat yaratildi');
     convs.c1aziza = conv.id;
@@ -1159,14 +1421,21 @@ async function clientBotTests(): Promise<void> {
     eq(toClient[0]!.text, `${HEADER_AZIZA}\nYana nimadir kerakmi?`, 'matn');
   });
 
-  await step('ikkinchi mijoz: deep link, izolyatsiya — Reply faqat o\'sha mijozga boradi', async () => {
+  await step("ikkinchi mijoz: eski deep link (/start staff_<id>) — tanlovsiz darhol suhbat; izolyatsiya — Reply faqat o'sha mijozga boradi", async () => {
     const before = mark('client', C2.id);
     await say('client', C2, `/start staff_${ids.aziza}`);
     const msgs = botMsgsSince('client', C2.id, before);
-    eq(msgs.length, 2, 'salomlashuv + karta');
-    eq(msgs[1]!.kind, 'photo', 'deep link — rasmli karta');
-    includes(msgs[1]!.text, 'Aziza Karimova', 'karta');
-    await press('client', C2, msgs[1], `pick:${ids.aziza}`);
+    eq(msgs.length, 1, 'bitta xabar (salomlashuv va menyusiz)');
+    eq(msgs[0]!.kind, 'photo', 'xodim rasmi bilan');
+    eq(
+      msgs[0]!.text,
+      linkCaption({ client: 'Vali', staff: 'Aziza Karimova', role: '👨‍💻 Operator · Katta operator' }),
+      'izoh',
+    );
+    ok(isRemoveKeyboardOnly(msgs[0]), `remove_keyboard, tugmasiz: ${JSON.stringify(msgs[0]!.markup)}`);
+    const c2conv = await convOf(C2.id, ids.aziza);
+    ok(c2conv, 'suhbat darhol yaratildi');
+    eq((await clientRow(C2.id)).active_conversation_id, c2conv.id, 'aktiv suhbat (tanlovsiz)');
     const staffBefore = mark('staff', OP1.id);
     const c2Before = mark('client', C2.id);
     await say('client', C2, 'Men Vali, salom');
@@ -1708,77 +1977,97 @@ async function miniAppTests(): Promise<void> {
     expectApi(await app('client', null, 'bootstrap', {}, expired), 401, 'eskirgan initData');
     const notStaff = await app('staff', STRANGER, 'bootstrap');
     eq(expectApi(notStaff, 403, 'xodim emas').error, 'not_staff', 'kod');
-    eq(expectApi(await app('client', C1, 'no.such.action'), 400, "noma'lum amal").error, 'unknown_action', 'kod');
+    eq(expectApi(await app('staff', OP1, 'no.such.action'), 400, "noma'lum amal").error, 'unknown_action', 'kod');
     const get = await appApi.fetch(new Request(`${ORIGIN}/api/app`));
     eq(get.status, 405, 'GET');
-    eq(expectApi(await app('client', C1, 'admin.stats'), 403, 'mijoz admin amali').error, 'admin_only', 'kod');
+    eq(expectApi(await app('client', C1, 'admin.stats'), 403, 'mijoz admin amali').error, 'client_app_disabled', 'kod');
     eq(expectApi(await app('staff', OP1, 'admin.stats'), 403, 'xodim admin amali').error, 'admin_only', 'kod');
-    eq(expectApi(await app('client', C1, 'status.set', { online: false }), 403, 'mijoz status.set').error, 'staff_only', 'kod');
+    eq(expectApi(await app('staff', ADMIN, 'status.set', { online: false }), 403, 'profilsiz admin status.set').error, 'staff_only', 'kod');
   });
 
-  await step('Mini App (mijoz): bootstrap, suhbat ochish, yuborish (avto-javob), sync, messages', async () => {
-    const b = expectApi(await app('client', C1, 'bootstrap'), 200, 'bootstrap');
-    eq(b.role, 'client', 'rol');
-    eq(b.me.id, C1.id, 'me.id');
-    eq(JSON.stringify(b.staff.map((s: any) => s.id)), JSON.stringify([ids.aziza, ids.sardor, ids.bobur]), 'xodimlar tartibi (operatorlar, keyin menejerlar)');
-    const aziza = b.staff[0];
-    eq(aziza.conversation_id, convs.c1aziza, 'Aziza kartasida suhbat id');
-    eq(aziza.role_label, 'Operator', 'role_label');
-    ok(String(aziza.photo_url).startsWith(`/api/media?staff=${ids.aziza}&v=`), `photo_url: ${aziza.photo_url}`);
-    eq(b.staff[2].photo_url, null, 'Bobur — rasm yo\'q');
-    const conv = b.conversations.find((c: any) => c.id === convs.c1aziza);
-    ok(conv, 'suhbatlar ro\'yxatida');
-    eq(conv.peer.name, 'Aziza Karimova', 'peer.name');
-    eq(conv.peer.subtitle, 'Operator · Katta operator', 'peer.subtitle');
-    eq(conv.is_active, true, 'aktiv');
-    eq(b.active_conversation_id, convs.c1aziza, 'active_conversation_id');
+  await step("Mini App (mijoz): o'chirilgan — har qanday amal 403 client_app_disabled, bazaga yozuv va Telegramga murojaatsiz", async () => {
+    const start = tg.calls.length;
+    const counts = async () =>
+      JSON.stringify(
+        (await sql`
+          select (select count(*)::int from clients) as clients, (select count(*)::int from messages) as messages,
+                 (select count(*)::int from conversations) as conversations, (select count(*)::int from user_state) as states`)[0],
+      );
+    const countsBefore = await counts();
+    const activeBefore = (await clientRow(C1.id)).active_conversation_id;
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['bootstrap', {}],
+      ['sync', {}],
+      ['sync', { conversationId: convs.c1aziza, afterId: 0 }],
+      ['conversation.open', { staffId: ids.bobur, activate: true }],
+      ['send', { conversationId: convs.c1aziza, text: 'Mini App dan' }],
+      ['messages', { conversationId: convs.c1aziza }],
+      ['resend', { messageId: 1 }],
+      ['retry', { messageId: 1 }],
+      ['conversations', {}],
+      ['status.set', { online: false }],
+      ['admin.stats', {}],
+      ['no.such.action', {}],
+      ['', {}],
+    ];
+    for (const [action, params] of cases) {
+      const r = await app('client', C1, action, params);
+      const what = `mijoz ${action || "(bo'sh amal)"}`;
+      eq(expectApi(r, 403, what).error, 'client_app_disabled', `${what}: kod`);
+      eq(r.body.message, CLIENT_APP_DISABLED, `${what}: matn`);
+    }
+    const up = await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, { bytes: UPLOAD_JPEG, name: 'r.jpg', type: 'image/jpeg' });
+    eq(expectApi(up, 403, 'mijoz upload').error, 'client_app_disabled', 'upload: kod');
+    // Bazada yo'q mijoz Mini App ni ochdi — yozuv yaratilmaydi
+    const fresh = await app('client', C9, 'bootstrap');
+    eq(expectApi(fresh, 403, 'yangi mijoz bootstrap').error, 'client_app_disabled', 'kod');
+    eq(await clientRow(C9.id), undefined, "yangi mijoz bazaga yozilmadi");
+    eq(await counts(), countsBefore, "bazada hech narsa o'zgarmadi");
+    eq((await clientRow(C1.id)).active_conversation_id, activeBefore, "aktiv suhbat o'zgarmadi");
+    eq(callsSince(start).length, 0, "Telegramga murojaat yo'q");
+    // initData siz — avvalgidek 401
+    expectApi(await app('client', null, 'bootstrap', {}, ''), 401, "initData siz");
+  });
 
-    const open = expectApi(await app('client', C1, 'conversation.open', { staffId: ids.bobur }), 200, 'conversation.open');
-    convs.c1bobur = open.conversation.id;
-    eq(open.conversation.peer.name, 'Bobur Aliyev', 'peer');
-    eq(open.conversation.is_active, true, 'yangi suhbat aktiv');
-    eq(open.messages.length, 0, "xabarlar yo'q");
-    eq(open.has_more, false, 'has_more');
-    eq((await clientRow(C1.id)).active_conversation_id, convs.c1bobur, 'bazada aktiv');
-    const unavailable = await app('client', C1, 'conversation.open', { staffId: 999999 });
-    eq(expectApi(unavailable, 404, 'mavjud bo\'lmagan xodim').error, 'staff_unavailable', 'kod');
+  await step("mijoz: xodimning shaxsiy havolasi (/start bobur) — darhol Bobur bilan suhbat (faol suhbat almashadi), birinchi xabar — shaxsiy avto-javob", async () => {
+    eq((await clientRow(C1.id)).active_conversation_id, convs.c1aziza, "boshlang'ich aktiv — Aziza");
+    const placeholder = (await sql`select value from settings where key = ${texts.SETTING_KEYS.placeholderPhoto}`)[0]?.value;
+    const start = tg.calls.length;
+    let before = mark('client', C1.id);
+    await say('client', C1, '/start bobur');
+    const msgs = botMsgsSince('client', C1.id, before);
+    eq(msgs.length, 1, 'bitta xabar');
+    eq(msgs[0]!.kind, 'photo', 'rasmli (rasmsiz xodim — standart avatar)');
+    eq(callsSince(start, CLIENT, 'sendPhoto')[0]?.params.photo, placeholder, 'keshlangan standart avatar');
+    eq(msgs[0]!.text, linkCaption({ client: 'Ali', staff: 'Bobur Aliyev', role: '👔 Menejer' }), 'izoh');
+    ok(boldName(msgs[0], 'Bobur Aliyev'), 'xodim ismi qalin');
+    ok(isRemoveKeyboardOnly(msgs[0]), `remove_keyboard, tugmasiz: ${JSON.stringify(msgs[0]!.markup)}`);
+    const conv = await convOf(C1.id, ids.bobur);
+    ok(conv, 'suhbat yaratildi');
+    convs.c1bobur = conv.id;
+    eq((await clientRow(C1.id)).active_conversation_id, convs.c1bobur, 'aktiv — Bobur');
 
-    eq(expectApi(await app('client', C1, 'send', { conversationId: convs.c1bobur, text: '   ' }), 400, "bo'sh matn").error, 'empty', 'kod');
-    eq(expectApi(await app('client', C1, 'send', { conversationId: convs.c1bobur, text: 'x'.repeat(4097) }), 400, 'uzun matn').error, 'text_too_long', 'kod');
-
-    const clientBefore = mark('client', C1.id);
     const staffBefore = mark('staff', MGR.id);
-    const sent = expectApi(await app('client', C1, 'send', { conversationId: convs.c1bobur, text: '  Mini App dan salom  ' }), 200, 'send');
-    eq(sent.message.text, 'Mini App dan salom', 'matn trim qilindi');
-    eq(sent.message.outgoing, true, 'outgoing');
-    eq(sent.message.sender, 'client', 'sender');
-    eq(sent.message.via, 'webapp', 'via');
-    eq(sent.delivered, true, 'delivered');
-    eq(sent.auto_reply?.text, 'Salom Ali! Men Bobur Aliyev, tez orada javob beraman.', 'shaxsiy avto-javob');
-    eq(sent.auto_reply?.sender, 'bot', 'avto-javob sender');
-    eq(sent.auto_reply?.outgoing, false, 'bot xabari outgoing emas');
-    eq(botMsgsSince('client', C1.id, clientBefore).map((m) => m.text).join('|'), 'Salom Ali! Men Bobur Aliyev, tez orada javob beraman.', 'avto-javob botga ham keldi');
+    const opBefore = mark('staff', OP1.id);
+    before = mark('client', C1.id);
+    await say('client', C1, 'Bot orqali salom');
+    eq(
+      botMsgsSince('client', C1.id, before).map((m) => m.text).join('|'),
+      'Salom Ali! Men Bobur Aliyev, tez orada javob beraman.',
+      "mijozga faqat shaxsiy avto-javob (boshqa izoh yo'q)",
+    );
     const toStaff = botMsgsSince('staff', MGR.id, staffBefore);
-    eq(toStaff[0]?.text, `🆕 ${HEADER_C1} · @ali_v\nMini App dan salom`, 'menejerga yetkazildi');
+    eq(toStaff.length, 1, 'menejerga bitta xabar');
+    eq(toStaff[0]?.text, `🆕 ${HEADER_C1} · @ali_v\nBot orqali salom`, 'menejerga yetkazildi');
+    eq(botMsgsSince('staff', OP1.id, opBefore).length, 0, 'Aziza hech narsa olmadi');
+    eq(await countMessages(convs.c1bobur, 'bot'), 1, 'bitta avto-javob');
 
     const inClientBefore = mark('client', C1.id);
     await say('staff', MGR, { text: 'Salom Ali, qanday yordam kerak?', replyTo: toStaff[0]!.id });
-    inClient.boburReply = botMsgsSince('client', C1.id, inClientBefore)[0]!.id;
-    const sync = expectApi(await app('client', C1, 'sync', { conversationId: convs.c1bobur, afterId: sent.message.id }), 200, 'sync');
-    const texts2 = sync.messages.map((m: any) => `${m.sender}:${m.text}`);
-    eq(JSON.stringify(texts2), JSON.stringify(['bot:Salom Ali! Men Bobur Aliyev, tez orada javob beraman.', 'staff:Salom Ali, qanday yordam kerak?']), 'sync xabarlari');
-    eq(sync.messages[1].outgoing, false, 'xodim xabari kiruvchi');
-    eq(sync.conversations.find((c: any) => c.id === convs.c1bobur)?.unread, 0, "sync — o'qildi");
-    eq((await convRow(convs.c1bobur)).unread_client, 0, "bazada o'qildi");
-    const empty = expectApi(await app('client', C1, 'sync', { conversationId: convs.c1bobur, afterId: sync.messages[1].id }), 200, 'sync (yangi yo\'q)');
-    eq(empty.messages.length, 0, "yangi xabar yo'q");
-
-    const page = expectApi(await app('client', C1, 'messages', { conversationId: convs.c1bobur, limit: 2 }), 200, 'messages');
-    eq(page.messages.length, 2, 'limit');
-    eq(page.has_more, true, 'has_more');
-    const older = expectApi(await app('client', C1, 'messages', { conversationId: convs.c1bobur, beforeId: page.messages[0].id }), 200, 'messages beforeId');
-    eq(older.messages.length, 1, 'oldingi sahifa');
-    eq(older.has_more, false, 'boshqa yo\'q');
+    const reply = botMsgsSince('client', C1.id, inClientBefore);
+    eq(reply.map((m) => m.text).join('|'), `👔 Bobur Aliyev\nSalom Ali, qanday yordam kerak?`, 'mijozga javob');
+    inClient.boburReply = reply[0]!.id;
+    eq((await staffRow(ids.bobur)).active_conversation_id, convs.c1bobur, 'Boburning aktiv suhbati — C1');
   });
 
   await step('mijoz boti: Reply orqali boshqa suhbatga yozish (aktiv almashadi, ogohlantirish)', async () => {
@@ -1820,8 +2109,14 @@ async function miniAppTests(): Promise<void> {
     eq((await clientRow(C1.id)).active_conversation_id, convs.c1bobur, 'aktiv — Bobur');
 
     // 3) Hech bir suhbatga bog'lanmagan bot xabariga (salomlashuv) Reply — hech kimga yuborilmaydi, so'raladi
+    // Salomlashuvda faqat rol tanlash (ls:) tugmalari bor — ular hech bir xodimga ishora qilmaydi, qalin ism ham yo'q
     const welcome = tg.sent(CLIENT, C1.id)[0];
-    ok(welcome?.text.startsWith('Assalomu alaykum, Ali! 👋') && !welcome.buttons.some((b) => b.callback_data), 'tugmasiz salomlashuv xabari');
+    ok(
+      welcome?.text.startsWith('Assalomu alaykum, Ali! 👋') &&
+        !welcome.buttons.some((b) => b.callback_data && !/^ls:/.test(b.callback_data)) &&
+        entitiesOf(welcome).every((e) => e.type !== 'bold'),
+      'faqat rol tugmali salomlashuv xabari',
+    );
     const msgCount = (await sql`select count(*)::int as n from messages`)[0]!.n;
     const start = tg.calls.length;
     const orphan = await say('client', C1, { text: 'Bu savol kimga?', replyTo: welcome!.id });
@@ -1887,22 +2182,26 @@ async function miniAppTests(): Promise<void> {
     await sql`delete from user_state where bot = 'client' and tg_user_id = ${C1.id}`;
   });
 
-  await step('Mini App (mijoz): fayl yuklash, media proksi, resend, xodim rasmi', async () => {
+  await step('media proksi: mijoz bot chatida yuborgan rasm va hujjat (imzolangan token), xodim rasmi', async () => {
+    eq((await clientRow(C1.id)).active_conversation_id, convs.c1aziza, 'aktiv — Aziza');
     const start = tg.calls.length;
-    const up = expectApi(
-      await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza, caption: 'Rasm' }, { bytes: UPLOAD_JPEG, name: 'rasm.jpg', type: 'image/jpeg' }),
-      200,
-      'upload',
-    );
-    eq(up.message.kind, 'photo', 'rasm sifatida');
-    eq(up.message.text, 'Rasm', 'izoh');
-    eq(up.message.media?.inline, true, 'inline');
-    ok(String(up.message.media?.url).startsWith('/api/media?t='), `media.url: ${up.message.media?.url}`);
-    uploadedPhotoMsgId = up.message.id;
-    uploadedPhotoUrl = up.message.media.url;
+    await say('client', C1, { photo: tg.photo(CLIENT, UPLOAD_JPEG), caption: 'Rasm' });
     const call = callsSince(start, STAFF, 'sendPhoto')[0];
     ok(call?.ok && call.multipart && bytesEqual(tg.fileBytes(call.uploaded[0]!), UPLOAD_JPEG), 'xodimga yuklandi');
     includes(tg.lastSent(STAFF, OP1.id)?.text, 'Rasm', 'xodim izohni oldi');
+    const photoRow = (await sql`
+      select id from messages where conversation_id = ${convs.c1aziza} and sender = 'client' and kind = 'photo'
+      order by id desc limit 1`)[0];
+    ok(photoRow, 'rasm saqlandi');
+    uploadedPhotoMsgId = Number(photoRow.id);
+    // Xodimning Mini App i rasmni imzolangan token bilan ko'rsatadi
+    const page = expectApi(await app('staff', OP1, 'messages', { conversationId: convs.c1aziza }), 200, 'xodim messages');
+    const dto = page.messages.find((m: any) => m.id === uploadedPhotoMsgId);
+    eq(dto?.kind, 'photo', 'rasm sifatida');
+    eq(dto?.text, 'Rasm', 'izoh');
+    eq(dto?.media?.inline, true, 'inline');
+    ok(String(dto?.media?.url).startsWith('/api/media?t='), `media.url: ${dto?.media?.url}`);
+    uploadedPhotoUrl = dto.media.url;
 
     const media = await mediaGet(uploadedPhotoUrl);
     eq(media.status, 200, 'media GET');
@@ -1922,56 +2221,30 @@ async function miniAppTests(): Promise<void> {
     const tokenFile = (await mediaGet(uploadedPhotoUrl)).headers.get('content-disposition');
     eq(tokenFile, 'inline', 'rasm — inline');
 
-    const doc = expectApi(
-      await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, { bytes: new TextEncoder().encode('eslatma matni'), name: 'notes.txt', type: 'text/plain' }),
-      200,
-      'upload (hujjat)',
-    );
-    eq(doc.message.kind, 'document', 'hujjat');
-    eq(doc.message.media?.inline, false, 'inline emas');
-    eq(doc.message.media?.url, null, 'url yo\'q');
-    eq(doc.message.media?.file_name, 'notes.txt', 'fayl nomi');
-    const docCall = tg.lastCall(STAFF, 'sendDocument');
+    // Hujjat (bot chatidan): media proksi uni «attachment» sifatida beradi
+    const docBytes = new TextEncoder().encode('eslatma matni');
+    const docStart = tg.calls.length;
+    await say('client', C1, { document: tg.document(CLIENT, docBytes, { file_name: 'notes.txt', mime_type: 'text/plain' }) });
+    const docCall = callsSince(docStart, STAFF, 'sendDocument')[0];
+    ok(docCall?.ok, 'hujjat xodimga yuborildi');
     eq(Object.values(docCall!.files)[0]?.filename, 'notes.txt', 'xodimga fayl nomi bilan');
-    eq(docCall!.params.disable_content_type_detection, true, 'disable_content_type_detection (Mini App hujjati)');
-
-    // GIF — animatsiya sifatida yuboriladi va saqlanadi (Telegram uni MPEG-4 ga aylantiradi), inline emas
-    const gif = new Uint8Array([...new TextEncoder().encode('GIF89a'), ...new Uint8Array(40)]);
-    const gifStart = tg.calls.length;
-    const g = expectApi(
-      await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, { bytes: gif, name: 'a.gif', type: 'image/gif' }),
-      200,
-      'upload (gif)',
-    );
-    eq(g.message.kind, 'animation', 'GIF — animatsiya');
-    eq(g.message.media?.inline, false, 'animatsiya inline emas');
-    eq(g.message.media?.url, null, "animatsiyada url yo'q");
-    eq(g.message.media?.mime_type, 'video/mp4', 'saqlangan MIME — video/mp4');
-    eq(callsSince(gifStart, STAFF, 'sendAnimation').length, 1, 'sendAnimation');
-    eq(callsSince(gifStart, STAFF, 'sendDocument').length, 0, 'hujjat sifatida yuborilmadi');
-    const docMedia = await mediaGet(`/api/media?t=${encodeURIComponent(auth.signMediaToken(doc.message.id))}`);
+    const docRow = (await sql`
+      select id from messages where conversation_id = ${convs.c1aziza} and kind = 'document' and file_name = 'notes.txt'
+      order by id desc limit 1`)[0];
+    ok(docRow, 'hujjat saqlandi');
+    const docDto = expectApi(await app('staff', OP1, 'messages', { conversationId: convs.c1aziza }), 200, 'xodim messages (hujjat)')
+      .messages.find((m: any) => m.id === Number(docRow.id));
+    eq(docDto?.media?.inline, false, 'hujjat inline emas');
+    eq(docDto?.media?.file_name, 'notes.txt', 'fayl nomi');
+    const docMedia = await mediaGet(`/api/media?t=${encodeURIComponent(auth.signMediaToken(Number(docRow.id)))}`);
     eq(docMedia.status, 200, 'hujjat media');
     includes(docMedia.headers.get('content-disposition'), 'attachment', 'rasm bo\'lmagan fayl — attachment');
+    ok(bytesEqual(docMedia.bytes, docBytes), 'hujjat baytlari');
 
-    const big = await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, { bytes: new Uint8Array(4 * 1024 * 1024 + 10), name: 'big.bin', type: 'application/octet-stream' });
-    eq(expectApi(big, 413, 'katta fayl').error, 'file_too_big', 'kod');
-    eq(expectApi(await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, null), 400, 'faylsiz').error, 'no_file', 'kod');
-
-    // resend: mijoz botida bu faylning file_id si yo'q — staff botdan qayta yuklanadi, keyin keshlanadi
-    let s2 = tg.calls.length;
-    expectApi(await app('client', C1, 'resend', { messageId: uploadedPhotoMsgId }), 200, 'resend');
-    const r1 = callsSince(s2, CLIENT, 'sendPhoto')[0];
-    ok(r1?.ok && r1.multipart, 'mijoz botiga qayta yuklandi');
-    includes(tg.lastSent(CLIENT, C1.id)?.text, '📥 Aziza Karimova bilan suhbatdan', 'resend sarlavhasi');
-    const row = (await sql`select * from messages where id = ${uploadedPhotoMsgId}`)[0];
-    eq(row.file_id_client, r1!.uploaded[0], 'file_id_client keshlandi');
-    s2 = tg.calls.length;
-    expectApi(await app('client', C1, 'resend', { messageId: uploadedPhotoMsgId }), 200, 'resend (2)');
-    const r2 = callsSince(s2, CLIENT, 'sendPhoto')[0];
-    ok(r2?.ok && !r2.multipart && r2.params.photo === row.file_id_client, 'ikkinchi marta — file_id');
-    eq(expectApi(await app('client', C1, 'resend', { messageId: 99999999 }), 404, 'yo\'q xabar').error, 'message_not_found', 'kod');
-
-    const v = String(expectApi(await app('client', C1, 'bootstrap'), 200, 'bootstrap').staff[0].photo_url);
+    // Xodimning ochiq rasmi (admin ro'yxatidagi photo_url)
+    const adminList = expectApi(await app('staff', ADMIN, 'admin.staff.list'), 200, 'admin.staff.list');
+    const v = String(adminList.staff.find((s: any) => s.id === ids.aziza)?.photo_url);
+    ok(v.startsWith(`/api/media?staff=${ids.aziza}&v=`), `photo_url: ${v}`);
     const photo = await mediaGet(v);
     eq(photo.status, 200, 'xodim rasmi');
     ok(bytesEqual(photo.bytes, AZIZA_JPEG), 'xodim rasmi baytlari');
@@ -2100,13 +2373,74 @@ async function miniAppTests(): Promise<void> {
     includes(firstPage, 'Salom! Buyurtmam qayerda? <tag> & 😀', 'eng birinchi xabar (oxirgi sahifada)');
   }, { allowFailedCalls: (c) => c.method === 'answerCallbackQuery' && c.error?.error_code === 400 });
 
-  await step('oflayn xodim: yangi mijozning avto-javobida oflayn izohi; bot orqali onlaynga qaytish', async () => {
+  await step("Mini App (xodim): hujjat va GIF yuklash (xodim → mijoz), katta fayl, faylsiz; resend — boshqa botdan qayta yuklab keshlanadi", async () => {
+    // Hujjat hujjatligicha qolsin (Telegram .mp3/.mp4 ni audio/video ga aylantirmasin)
+    const doc = expectApi(
+      await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza }, { bytes: new TextEncoder().encode('eslatma matni'), name: 'notes.txt', type: 'text/plain' }),
+      200,
+      'upload (hujjat)',
+    );
+    eq(doc.message.kind, 'document', 'hujjat');
+    eq(doc.message.media?.inline, false, 'inline emas');
+    eq(doc.message.media?.url, null, "url yo'q");
+    eq(doc.message.media?.file_name, 'notes.txt', 'fayl nomi');
+    const docCall = tg.lastCall(CLIENT, 'sendDocument');
+    eq(Object.values(docCall!.files)[0]?.filename, 'notes.txt', 'mijozga fayl nomi bilan');
+    eq(docCall!.params.disable_content_type_detection, true, 'disable_content_type_detection (Mini App hujjati)');
+
+    // GIF — animatsiya sifatida yuboriladi va saqlanadi (Telegram uni MPEG-4 ga aylantiradi), inline emas
+    const gif = new Uint8Array([...new TextEncoder().encode('GIF89a'), ...new Uint8Array(40)]);
+    const gifStart = tg.calls.length;
+    const g = expectApi(
+      await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza }, { bytes: gif, name: 'a.gif', type: 'image/gif' }),
+      200,
+      'upload (gif)',
+    );
+    eq(g.message.kind, 'animation', 'GIF — animatsiya');
+    eq(g.message.media?.inline, false, 'animatsiya inline emas');
+    eq(g.message.media?.url, null, "animatsiyada url yo'q");
+    eq(g.message.media?.mime_type, 'video/mp4', 'saqlangan MIME — video/mp4');
+    eq(callsSince(gifStart, CLIENT, 'sendAnimation').length, 1, 'sendAnimation');
+    eq(callsSince(gifStart, CLIENT, 'sendDocument').length, 0, 'hujjat sifatida yuborilmadi');
+
+    const big = await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza }, { bytes: new Uint8Array(4 * 1024 * 1024 + 10), name: 'big.bin', type: 'application/octet-stream' });
+    eq(expectApi(big, 413, 'katta fayl').error, 'file_too_big', 'kod');
+    eq(expectApi(await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza }, null), 400, 'faylsiz').error, 'no_file', 'kod');
+
+    // resend: xodim Mini App dan yuklagan rasm faqat mijoz botida bor — xodimlar botiga qayta yuklanadi, keyin keshlanadi
+    const jpeg = fakeJpeg({ width: 300, height: 300, size: 3000, seed: 78 });
+    const up = expectApi(
+      await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza, caption: 'Resend uchun' }, { bytes: jpeg, name: 'r.jpg', type: 'image/jpeg' }),
+      200,
+      'upload (rasm)',
+    );
+    let s2 = tg.calls.length;
+    expectApi(await app('staff', OP1, 'resend', { messageId: up.message.id }), 200, 'resend');
+    const r1 = callsSince(s2, STAFF, 'sendPhoto')[0];
+    ok(r1?.ok && r1.multipart && bytesEqual(tg.fileBytes(r1.uploaded[0]!), jpeg), 'xodimlar botiga qayta yuklandi');
+    includes(tg.lastSent(STAFF, OP1.id)?.text, '📥 Ali Valiyev bilan suhbatdan', 'resend sarlavhasi');
+    const row = (await sql`select * from messages where id = ${up.message.id}`)[0];
+    eq(row.file_id_staff, r1!.uploaded[0], 'file_id_staff keshlandi');
+    s2 = tg.calls.length;
+    expectApi(await app('staff', OP1, 'resend', { messageId: up.message.id }), 200, 'resend (2)');
+    const r2 = callsSince(s2, STAFF, 'sendPhoto')[0];
+    ok(r2?.ok && !r2.multipart && r2.params.photo === row.file_id_staff, 'ikkinchi marta — file_id');
+    eq(expectApi(await app('staff', OP1, 'resend', { messageId: 99999999 }), 404, "yo'q xabar").error, 'message_not_found', 'kod');
+  });
+
+  await step("oflayn xodim: havola orqali kirishda va avto-javobda oflayn izohi; bot orqali onlaynga qaytish; profil va yordamda mijozlar havolasi", async () => {
     const before = mark('client', C3.id);
     await say('client', C3, `/start staff_${ids.aziza}`);
     const msgs = botMsgsSince('client', C3.id, before);
-    includes(msgs[1]?.text, 'Hozir oflayn', 'kartada oflayn holati');
-    await press('client', C3, msgs[1], `pick:${ids.aziza}`);
-    includes(lastBot('client', C3.id)?.text, 'Hozir oflayn', 'tanlash xabarida oflayn izohi');
+    eq(msgs.length, 1, 'bitta rasmli xabar');
+    eq(msgs[0]!.kind, 'photo', 'rasm bilan');
+    eq(
+      msgs[0]!.text,
+      linkCaption({ client: 'Guli <3', staff: 'Aziza Karimova', role: '👨‍💻 Operator · Katta operator', offline: true }),
+      'izohda oflayn holati (ism escape qilingan)',
+    );
+    ok(isRemoveKeyboardOnly(msgs[0]), 'tugmasiz');
+    eq((await clientRow(C3.id)).active_conversation_id, (await convOf(C3.id, ids.aziza))?.id, 'darhol aktiv suhbat');
     const b2 = mark('client', C3.id);
     const staffBefore = mark('staff', OP1.id);
     await say('client', C3, 'Salom');
@@ -2124,6 +2458,14 @@ async function miniAppTests(): Promise<void> {
     eq(prof?.kind, 'photo', 'profil — rasm bilan');
     includes(prof?.text, 'Aziza Karimova', 'profil');
     includes(prof?.text, 'Profilni admin tahrirlaydi', 'izoh');
+    // Mijozlar uchun shaxsiy havola: nusxalash (copy_text) va ulashish (t.me/share) tugmalari
+    includes(prof?.text, `🔗 Mijozlar uchun havolangiz: ${clientLink('aziza')}`, 'profilda mijozlar havolasi');
+    includes(prof?.text, 'Mijoz shu havola orqali kirsa, darhol siz bilan chat boshlanadi.', 'havola izohi');
+    const copy = prof?.buttons.find((b) => b.text === '📋 Nusxalash');
+    eq((copy as any)?.copy_text?.text, clientLink('aziza'), '«📋 Nusxalash» — havola');
+    eq(prof?.buttons.find((b) => b.text === '📤 Ulashish')?.url, shareUrlFor(clientLink('aziza')), '«📤 Ulashish» — t.me/share');
+    eq(copy?.row, 0, 'havola tugmalari birinchi qatorda');
+    eq(findButton(prof, 'chats:0:n')?.row, 1, '«💬 Chatlar» ikkinchi qatorda');
     // Profil kartasidagi «💬 Chatlar» (chats:0:n): rasmli karta o'chirilmaydi, ro'yxat yangi xabarda
     const s0 = tg.calls.length;
     await press('staff', OP1, prof, 'chats:0:n');
@@ -2133,6 +2475,8 @@ async function miniAppTests(): Promise<void> {
     includes(lastBot('staff', OP1.id)?.text, 'Chatlaringiz', "ro'yxat yangi xabarda");
     await say('staff', OP1, 'ℹ️ Yordam');
     includes(lastBot('staff', OP1.id)?.text, 'Javob berishning 3 usuli', 'yordam');
+    includes(lastBot('staff', OP1.id)?.text, `🔗 Shaxsiy havolangiz: ${clientLink('aziza')}`, 'yordamda shaxsiy havola');
+    includes(lastBot('staff', OP1.id)?.text, 'havola orqali kirgan mijoz hech narsa tanlamasdan darhol siz bilan yozishadi', 'yordamda izoh');
   });
 
   await step('maxfiylik (Mini App): begona suhbatlar — 403', async () => {
@@ -2148,23 +2492,25 @@ async function miniAppTests(): Promise<void> {
     }
     const ob = expectApi(await app('staff', OP2, 'bootstrap'), 200, 'OP2 bootstrap');
     eq(ob.conversations.length, 0, 'OP2 da begona suhbatlar yo\'q');
+    // Mijozlar uchun Mini App umuman yopiq — begona suhbatga ham, o'ziga ham
     for (const [action, params] of [
       ['messages', { conversationId: convs.c1aziza }],
       ['conversation.open', { conversationId: convs.c1aziza }],
       ['send', { conversationId: convs.c1aziza, text: 'hack' }],
     ] as const) {
-      eq(expectApi(await app('client', C2, action, params), 403, `C2 ${action}`).error, 'forbidden', `C2 ${action} kodi`);
+      eq(expectApi(await app('client', C2, action, params), 403, `C2 ${action}`).error, 'client_app_disabled', `C2 ${action} kodi`);
     }
     const adminRead = await app('staff', ADMIN, 'messages', { conversationId: convs.c1aziza });
     eq(adminRead.status, 403, 'admin ham suhbat mazmunini ko\'ra olmaydi');
-    eq(expectApi(await app('client', C2, 'messages', { conversationId: 99999999 }), 404, "yo'q suhbat").error, 'not_found', 'kod');
-    eq(expectApi(await app('client', C2, 'messages', { conversationId: 'abc' }), 400, "noto'g'ri id").error, 'invalid_id', 'kod');
+    eq(expectApi(await app('staff', OP2, 'messages', { conversationId: 99999999 }), 404, "yo'q suhbat").error, 'not_found', 'kod');
+    eq(expectApi(await app('staff', OP2, 'messages', { conversationId: 'abc' }), 400, "noto'g'ri id").error, 'invalid_id', 'kod');
   });
 
   await step('Mini App (admin): bootstrap, statistika, sozlamalar (escape), xodimni tahrirlash', async () => {
     const b = expectApi(await app('staff', ADMIN, 'bootstrap'), 200, 'admin bootstrap');
     eq(b.me, null, 'admin xodim emas');
     eq(b.is_admin, true, 'is_admin');
+    eq(b.client_bot, 'uzgroww_bot', 'client_bot (profilsiz admin ham)');
     const st = expectApi(await app('staff', ADMIN, 'admin.stats'), 200, 'admin.stats');
     eq(st.clients, 3, 'mijozlar');
     eq(st.staff_total, 3, 'xodimlar');
@@ -2177,9 +2523,21 @@ async function miniAppTests(): Promise<void> {
     eq(g.defaults.welcome, texts.DEFAULT_WELCOME, 'defaults');
     const setRes = expectApi(await app('staff', ADMIN, 'admin.settings.set', { welcome: 'Xush kelibsiz, {name}! <b> & co' }), 200, 'settings.set');
     eq(setRes.welcome, 'Xush kelibsiz, {name}! <b> & co', 'saqlandi');
-    const before = mark('client', C3.id);
+    // Mavjud xodim bilan faol suhbati bor mijoz: /start — salomlashuv emas, "Siz … bilan suhbatdasiz" (+ rol tugmalari)
+    let before = mark('client', C3.id);
     await say('client', C3, '/start');
-    eq(botMsgsSince('client', C3.id, before)[0]?.text, 'Xush kelibsiz, Guli <3! <b> & co', 'yangi salomlashuv (escape)');
+    const c3Start = botMsgsSince('client', C3.id, before);
+    eq(c3Start.length, 1, 'bitta xabar');
+    eq(c3Start[0]!.text, '👋 Siz Aziza Karimova bilan suhbatdasiz — savolingizni shu yerga yozavering.', 'faol suhbat haqida');
+    ok(boldName(c3Start[0], 'Aziza Karimova'), 'xodim ismi qalin');
+    ok(isRoleRowOnly(c3Start[0]), 'boshqa xodim tanlash uchun rol tugmalari');
+    // Faol suhbati yo'q mijoz — sozlangan salomlashuv (HTML escape)
+    before = mark('client', C6.id);
+    await say('client', C6, '/start');
+    const c6Start = botMsgsSince('client', C6.id, before);
+    eq(c6Start.length, 1, 'bitta xabar (yangi mijoz)');
+    eq(c6Start[0]?.text, 'Xush kelibsiz, Lola <3! <b> & co', 'yangi salomlashuv (escape)');
+    ok(isRoleRowOnly(c6Start[0]), 'rol tugmalari');
     const reset = expectApi(await app('staff', ADMIN, 'admin.settings.set', { welcome: '' }), 200, 'settings reset');
     eq(reset.welcome, null, 'standartga qaytdi');
     eq(expectApi(await app('staff', ADMIN, 'admin.settings.set', { welcome: 'x'.repeat(2001) }), 400, 'uzun sozlama').error, 'validation', 'kod');
@@ -2190,6 +2548,90 @@ async function miniAppTests(): Promise<void> {
     eq(expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: ids.sardor, patch: { full_name: 'A' } }), 400, 'qisqa ism').error, 'validation', 'kod');
     eq(expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: ids.sardor, patch: {} }), 400, "bo'sh patch").error, 'no_patch', 'kod');
     eq(expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: 999999, patch: { position: 'x' } }), 404, "yo'q xodim").error, 'staff_not_found', 'kod');
+  });
+
+  await step("admin (Mini App): havola nomi — 400 link_invalid, 409 link_taken (boshqa maydonlar saqlanmaydi), 200 (normallashtirish, xodim xabardor), create bilan", async () => {
+    const upd = (patch: Record<string, unknown>) => app('staff', ADMIN, 'admin.staff.update', { id: ids.sardor, patch });
+    eq((await staffRow(ids.sardor)).link_code, 'sardor', "boshlang'ich nom");
+    for (const bad of ['a b', null, '', '   ', 'a', 'staff_12', 'Азиза', 'x'.repeat(33), 'bad!name', 42]) {
+      const r = await upd({ link_code: bad });
+      eq(expectApi(r, 400, `link_code ${JSON.stringify(bad)}`).error, 'link_invalid', `${JSON.stringify(bad)}: kod`);
+      eq(r.body.message, "Havola nomi 2–32 ta lotin harfi, raqam yoki _ bo'lishi kerak", `${JSON.stringify(bad)}: matn`);
+    }
+    // Band nom (katta-kichik harf farqsiz): 409 va shu patch dagi boshqa maydonlar ham saqlanmaydi
+    const taken = await upd({ link_code: 'BOBUR', position: 'Yangi lavozim' });
+    eq(expectApi(taken, 409, 'band nom').error, 'link_taken', 'kod');
+    eq(taken.body.message, 'Bu havola nomi band', 'matn');
+    let row = await staffRow(ids.sardor);
+    eq(row.link_code, 'sardor', "nom o'zgarmadi");
+    eq(row.position, 'Bosh operator', 'boshqa maydon ham saqlanmadi');
+
+    // To'g'ri nom: trim, @ va katta harflar normallashtiriladi; ulangan xodim (OP2) xabardor qilinadi
+    let opMark = mark('staff', OP2.id);
+    const okr = expectApi(await upd({ link_code: '  @Sardor_Op ' }), 200, "to'g'ri nom");
+    eq(okr.staff.link_code, 'sardor_op', 'link_code');
+    eq(okr.staff.client_link, clientLink('sardor_op'), 'client_link');
+    eq((await staffRow(ids.sardor)).link_code, 'sardor_op', 'bazada');
+    let note = botMsgsSince('staff', OP2.id, opMark);
+    eq(note.length, 1, 'xodimga bitta xabarnoma');
+    includes(note[0]!.text, `🔗 Admin mijozlar uchun havolangizni o'zgartirdi:\n${clientLink('sardor_op')}`, 'xabarnoma');
+    // Xuddi shu nom — o'zgarishsiz, xabarnoma yo'q
+    opMark = mark('staff', OP2.id);
+    eq(expectApi(await upd({ link_code: 'SARDOR_OP' }), 200, 'xuddi shu nom').staff.link_code, 'sardor_op', 'o\'zgarmadi');
+    eq(botMsgsSince('staff', OP2.id, opMark).length, 0, "o'zgarmagan nom — xabarnoma yo'q");
+    // patch siz (yuqori darajadagi link_code) ham qabul qilinadi; boshqa maydon bilan birga
+    const top = expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: ids.sardor, link_code: 'sardor' }), 200, 'patch siz');
+    eq(top.staff.link_code, 'sardor', 'qaytarildi');
+    eq(botMsgsSince('staff', OP2.id, opMark).length, 1, 'qaytarishda ham xabarnoma');
+    const both = expectApi(await upd({ position: 'Bosh operator', link_code: 'sardor' }), 200, 'lavozim + o\'sha nom');
+    eq(both.staff.position, 'Bosh operator', 'lavozim');
+    eq(expectApi(await upd({}), 400, "bo'sh patch").error, 'no_patch', 'kod');
+    eq(
+      expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: 999999, patch: { link_code: 'yangi_nom' } }), 404, "yo'q xodim").error,
+      'staff_not_found',
+      'kod',
+    );
+    eq(
+      expectApi(await app('staff', OP1, 'admin.staff.update', { id: ids.sardor, patch: { link_code: 'x_1' } }), 403, 'oddiy xodim').error,
+      'admin_only',
+      'kod',
+    );
+    row = await staffRow(ids.sardor);
+    eq(row.link_code, 'sardor', 'yakuniy nom');
+
+    // Yangi xodim: ixtiyoriy link_code; band/noto'g'ri bo'lsa ham xodim qo'shiladi, avtomatik nom qoladi + ogohlantirish
+    const created: number[] = [];
+    try {
+      const create = async (params: Record<string, unknown>) => {
+        const r = expectApi(await app('staff', ADMIN, 'admin.staff.create', params), 200, `create ${JSON.stringify(params)}`);
+        created.push(r.staff.id);
+        return r;
+      };
+      const t1 = await create({ role: 'operator', full_name: 'Aziza Ikkinchi', link_code: 'AZIZA' });
+      eq(t1.staff.link_code, 'aziza2', 'band — avtomatik nom qoldi');
+      eq(t1.staff.client_link, clientLink('aziza2'), 'client_link');
+      eq(t1.warning_code, 'link_taken', 'warning_code');
+      eq(t1.warning, "⚠️ Xodim qo'shildi, lekin «aziza» havola nomi band. Avtomatik nom qoldirildi: aziza2", 'warning');
+      const t2 = await create({ role: 'manager', full_name: 'Bobur Boss', link_code: '  @Bobur_Boss ' });
+      eq(t2.staff.link_code, 'bobur_boss', "o'z nomi (normallashtirilgan)");
+      eq(t2.warning, undefined, "ogohlantirish yo'q");
+      const t3 = await create({ role: 'operator', full_name: 'Test Xato', link_code: 'a b' });
+      eq(t3.staff.link_code, 'test', "noto'g'ri — avtomatik nom qoldi");
+      eq(t3.warning_code, 'link_invalid', 'warning_code');
+      eq(
+        t3.warning,
+        "⚠️ Xodim qo'shildi, lekin havola nomi noto'g'ri (2–32 ta lotin harfi, raqam yoki _ bo'lishi kerak). Avtomatik nom qoldirildi: test",
+        'warning',
+      );
+      const t4 = await create({ role: 'operator', full_name: 'Omad Yangi', link_code: '' });
+      eq(t4.staff.link_code, 'omad', "bo'sh — avtomatik nom");
+      eq(t4.warning, undefined, "bo'sh — ogohlantirish yo'q");
+      const t5 = await create({ role: 'operator', full_name: 'Omad Boshqa', link_code: null });
+      eq(t5.staff.link_code, 'omad2', 'null — avtomatik nom (band — raqam bilan)');
+      eq(t5.warning, undefined, "null — ogohlantirish yo'q");
+    } finally {
+      for (const id of created) await sql`delete from staff where id = ${id}`;
+    }
   });
 }
 
@@ -2205,9 +2647,9 @@ async function adminBotSettingsTests(): Promise<void> {
     includes(saved?.text, 'saqlandi', 'saqlandi');
     includes(saved?.text, 'Salom Aziz, xush kelibsiz! <3', 'namuna (escape)');
     eq((await sql`select value from settings where key = ${texts.SETTING_KEYS.welcome}`)[0]?.value, 'Salom {name}, xush kelibsiz! <3', 'bazada');
-    const c3Before = mark('client', C3.id);
-    await say('client', C3, '/start');
-    eq(botMsgsSince('client', C3.id, c3Before)[0]?.text, 'Salom Guli <3, xush kelibsiz! <3', 'mijoz yangi matnni oldi');
+    const c6Before = mark('client', C6.id);
+    await say('client', C6, '/start');
+    eq(botMsgsSince('client', C6.id, c6Before)[0]?.text, 'Salom Lola <3, xush kelibsiz! <3', 'mijoz yangi matnni oldi');
 
     await press('staff', ADMIN, saved, 'adm:set:welcome');
     await press('staff', ADMIN, tg.message(STAFF, ADMIN.id, saved!.id), 'adm:reset:welcome');
@@ -2258,7 +2700,8 @@ async function adminBotSettingsTests(): Promise<void> {
     await forge('staff', ADMIN, home2, 'adm:stats');
     const stats = tg.message(STAFF, ADMIN.id, home2.id);
     includes(stats?.text, 'Statistika', 'statistika');
-    includes(stats?.text, 'Mijozlar: 3', 'mijozlar soni');
+    // C1, C2, C3 va salomlashuvni tekshirgan C6 (Mini App ni ochgan C9 bazaga yozilmagan)
+    includes(stats?.text, 'Mijozlar: 4', 'mijozlar soni');
     includes(stats?.text, 'Aziza Karimova', 'xodimlar bo\'yicha');
     ok(!findButton(stats, 'noop') && !findButton(stats, 'adm:stats:1'), "bitta sahifa — sahifa tugmalari yo'q");
 
@@ -2290,21 +2733,26 @@ async function adminBotSettingsTests(): Promise<void> {
 
   await step("sozlamalar: bazada to'g'ridan-to'g'ri o'zgartirilgan salomlashuv /start da darhol ko'rinadi (instansiya keshi yo'q)", async () => {
     // Kesh bo'lganida — shu yerda «isiydi»
-    await say('client', C3, '/start');
+    await say('client', C6, '/start');
     try {
       await sql`
         insert into settings (key, value) values (${texts.SETTING_KEYS.welcome}, 'DB {name}')
         on conflict (key) do update set value = excluded.value, updated_at = now()`;
-      const b = mark('client', C3.id);
-      await say('client', C3, '/start');
-      eq(botMsgsSince('client', C3.id, b)[0]?.text, 'DB Guli <3', 'bazadagi yangi matn darhol ishlatildi');
+      const b = mark('client', C6.id);
+      await say('client', C6, '/start');
+      eq(botMsgsSince('client', C6.id, b)[0]?.text, 'DB Lola <3', 'bazadagi yangi matn darhol ishlatildi');
+      // v1 dagi standart matn («📱 Menyu», pastki tugmalar) sozlamada qolgan bo'lsa — yangi qisqa standart ko'rsatiladi
+      await sql`update settings set value = ${LEGACY_DEFAULT_WELCOME} where key = ${texts.SETTING_KEYS.welcome}`;
+      const bl = mark('client', C6.id);
+      await say('client', C6, '/start');
+      eq(botMsgsSince('client', C6.id, bl)[0]?.text, welcomeFor('Lola <3'), 'eski standart matn — yangi standart bilan almashtirildi');
     } finally {
       await sql`delete from settings where key = ${texts.SETTING_KEYS.welcome}`;
     }
-    const b2 = mark('client', C3.id);
-    await say('client', C3, '/start');
-    const w = botMsgsSince('client', C3.id, b2)[0]?.text ?? '';
-    ok(w.startsWith('Assalomu alaykum, Guli <3!'), `o'chirilgandan keyin standart matn: ${w.slice(0, 40)}`);
+    const b2 = mark('client', C6.id);
+    await say('client', C6, '/start');
+    const w = botMsgsSince('client', C6.id, b2)[0]?.text ?? '';
+    eq(w, welcomeFor('Lola <3'), "o'chirilgandan keyin standart matn");
   });
 
   await step("admin (bot): albom (3 ta rasm) lavozim bosqichida — faqat BITTA qayta so'rov", async () => {
@@ -2379,6 +2827,211 @@ async function adminBotSettingsTests(): Promise<void> {
   });
 }
 
+/** Xodimning shaxsiy havolasi (/start <nom>) orqali kirish va sodda mijozlar boti (v2). */
+async function linkEntryTests(): Promise<void> {
+  await step("havola: yangi mijoz /start aziza — tanlovsiz darhol suhbat, BITTA rasmli xabar (tugmasiz, remove_keyboard); birinchi xabar — bitta avto-javob va Azizaga", async () => {
+    const aziza = await staffRow(ids.aziza);
+    ok(aziza.is_online && !aziza.bot_blocked, 'Aziza onlayn');
+    const start = tg.calls.length;
+    const before = mark('client', C7.id);
+    await say('client', C7, '/start aziza');
+    const msgs = botMsgsSince('client', C7.id, before);
+    eq(msgs.length, 1, "bitta xabar (salomlashuv va menyu yo'q)");
+    const m = msgs[0]!;
+    eq(m.kind, 'photo', 'xodim rasmi bilan');
+    eq(m.text, linkCaption({ client: 'Kamola', staff: 'Aziza Karimova', role: '👨‍💻 Operator · Katta operator' }), 'izoh');
+    ok(boldName(m, 'Aziza Karimova'), 'xodim ismi qalin');
+    ok(isRemoveKeyboardOnly(m), `remove_keyboard, inline tugmasiz: ${JSON.stringify(m.markup)}`);
+    excludes(m.text, "Kim bilan bog'lanmoqchisiz", "salomlashuv matni yo'q");
+    eq(tg.keyboard(CLIENT, C7.id), null, "doimiy klaviatura yo'q");
+    eq(callsSince(start, CLIENT, 'sendPhoto')[0]?.params.photo, aziza.client_photo_file_id, 'keshlangan rasm (mijoz boti file_id)');
+    eq(callsSince(start, CLIENT, 'sendMessage').length, 0, "matnli xabar yuborilmadi");
+    const conv = await convOf(C7.id, ids.aziza);
+    ok(conv, 'suhbat yaratildi');
+    convs.c7aziza = conv.id;
+    eq(conv.last_message_at, null, "hali xabar yo'q");
+    eq((await clientRow(C7.id)).active_conversation_id, conv.id, 'aktiv suhbat');
+
+    const cb = mark('client', C7.id);
+    const sb = mark('staff', OP1.id);
+    await say('client', C7, 'Salom, havola orqali keldim');
+    const toClient = botMsgsSince('client', C7.id, cb);
+    eq(toClient.length, 1, "mijozga faqat avto-javob («boshqa xodimga ketdi» izohi yo'q)");
+    eq(toClient[0]!.text, texts.fill(texts.DEFAULT_GREETING, { name: 'Kamola', staff: 'Aziza Karimova' }), 'avto-javob');
+    const toStaff = botMsgsSince('staff', OP1.id, sb);
+    eq(toStaff.length, 1, 'xodimga bitta xabar');
+    eq(toStaff[0]!.text, '🆕 👤 Kamola · @kamola_k\nSalom, havola orqali keldim', 'Azizaga yetkazildi');
+    ok(findButton(toStaff[0], `act:${conv.id}`), '«↩️ Javob berish»');
+    eq(await countMessages(conv.id, 'bot'), 1, 'bitta avto-javob');
+    eq(await countMessages(conv.id, 'client'), 1, 'mijoz xabari saqlandi');
+
+    const cb2 = mark('client', C7.id);
+    await say('client', C7, 'Yana bir savol');
+    eq(botMsgsSince('client', C7.id, cb2).length, 0, 'ikkinchi xabarga javob yo\'q');
+    eq(await countMessages(conv.id, 'bot'), 1, 'avto-javob takrorlanmadi');
+  });
+
+  await step("havola: katta harf (/start AZIZA — «Siz yana …»), /start STAFF_<id> (rasmsiz — avatar); oddiy /start va /menu — «Siz … bilan suhbatdasiz» + faqat rol tugmalari", async () => {
+    let before = mark('client', C7.id);
+    await say('client', C7, '/start AZIZA');
+    let msgs = botMsgsSince('client', C7.id, before);
+    eq(msgs.length, 1, 'bitta xabar');
+    eq(msgs[0]!.kind, 'photo', 'rasm');
+    eq(
+      msgs[0]!.text,
+      linkCaption({ client: 'Kamola', staff: 'Aziza Karimova', role: '👨‍💻 Operator · Katta operator', existing: true }),
+      'mavjud suhbat — «Siz yana … bilan suhbatdasiz»',
+    );
+    ok(isRemoveKeyboardOnly(msgs[0]), 'tugmasiz');
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7aziza, 'aktiv — Aziza');
+
+    const placeholder = (await sql`select value from settings where key = ${texts.SETTING_KEYS.placeholderPhoto}`)[0]?.value;
+    const start = tg.calls.length;
+    before = mark('client', C7.id);
+    await say('client', C7, `/start STAFF_${ids.bobur}`);
+    msgs = botMsgsSince('client', C7.id, before);
+    eq(msgs.length, 1, 'bitta xabar (STAFF_<id>)');
+    eq(msgs[0]!.kind, 'photo', 'standart avatar bilan');
+    eq(callsSince(start, CLIENT, 'sendPhoto')[0]?.params.photo, placeholder, 'keshlangan standart avatar');
+    eq(msgs[0]!.text, linkCaption({ client: 'Kamola', staff: 'Bobur Aliyev', role: '👔 Menejer' }), 'izoh (menejer, lavozimsiz)');
+    const c7bobur = await convOf(C7.id, ids.bobur);
+    ok(c7bobur, 'Bobur bilan suhbat');
+    convs.c7bobur = c7bobur.id;
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7bobur, 'aktiv — Bobur');
+
+    for (const cmd of ['/start', '/menu']) {
+      before = mark('client', C7.id);
+      await say('client', C7, cmd);
+      msgs = botMsgsSince('client', C7.id, before);
+      eq(msgs.length, 1, `${cmd}: bitta xabar`);
+      eq(msgs[0]!.text, '👋 Siz Bobur Aliyev bilan suhbatdasiz — savolingizni shu yerga yozavering.', `${cmd}: faol suhbat`);
+      ok(boldName(msgs[0], 'Bobur Aliyev'), `${cmd}: ism qalin`);
+      ok(isRoleRowOnly(msgs[0]), `${cmd}: faqat rol tugmalari: ${JSON.stringify(msgs[0]!.markup)}`);
+      excludes(msgs[0]!.text, 'Asosiy menyu', `${cmd}: eski menyu yo'q`);
+    }
+    eq(tg.keyboard(CLIENT, C7.id), null, "doimiy klaviatura hech qachon yuborilmadi");
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7bobur, "/start faol suhbatni o'zgartirmaydi");
+  });
+
+  await step("havola: tugmasiz bot xabarlariga Reply (havola xabari, «suhbatdasiz», «✍️ Yozish» tasdig'i) — qalin ism bo'yicha o'sha xodimga, so'rovsiz", async () => {
+    const sent = tg.sent(CLIENT, C7.id);
+    const azizaCard = [...sent].reverse().find((m) => m.kind === 'photo' && m.text.includes('Siz yana Aziza Karimova'));
+    const boburCard = [...sent].reverse().find((m) => m.kind === 'photo' && m.text.includes('Siz Bobur Aliyev'));
+    const startMsg = [...sent].reverse().find((m) => m.text.includes('bilan suhbatdasiz — savolingizni'));
+    ok(azizaCard && boburCard && startMsg, 'bot xabarlari topildi');
+
+    // 1) Aktiv — Bobur, lekin Aziza havola xabariga Reply — Azizaga, aktiv almashadi
+    let cb = mark('client', C7.id);
+    let op = mark('staff', OP1.id);
+    let mg = mark('staff', MGR.id);
+    await say('client', C7, { text: 'Azizaga Reply orqali', replyTo: azizaCard!.id });
+    eq(textsSince('staff', OP1.id, op), '👤 Kamola · @kamola_k\nAzizaga Reply orqali', 'Aziza oldi');
+    eq(botMsgsSince('staff', MGR.id, mg).length, 0, 'Bobur olmadi');
+    let toClient = textsSince('client', C7.id, cb);
+    excludes(toClient, 'Bu xabar kimga', "so'rov yo'q");
+    includes(toClient, 'Endi xabarlaringiz Aziza Karimovaga yuboriladi', 'faol suhbat almashdi');
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7aziza, 'aktiv — Aziza');
+
+    // 2) «Siz Bobur Aliyev bilan suhbatdasiz» (faqat rol tugmali) xabariga Reply — Boburga (birinchi xabar: avto-javob)
+    cb = mark('client', C7.id);
+    op = mark('staff', OP1.id);
+    mg = mark('staff', MGR.id);
+    await say('client', C7, { text: 'Boburga Reply orqali', replyTo: startMsg!.id });
+    eq(textsSince('staff', MGR.id, mg), '🆕 👤 Kamola · @kamola_k\nBoburga Reply orqali', 'Bobur oldi');
+    eq(botMsgsSince('staff', OP1.id, op).length, 0, 'Aziza olmadi');
+    toClient = textsSince('client', C7.id, cb);
+    excludes(toClient, 'Bu xabar kimga', "so'rov yo'q");
+    includes(toClient, 'Salom Kamola! Men Bobur Aliyev, tez orada javob beraman.', 'Boburning avto-javobi');
+    includes(toClient, 'Endi xabarlaringiz Bobur Aliyevga yuboriladi', 'faol suhbat almashdi');
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7bobur, 'aktiv — Bobur');
+
+    // 3) «✍️ Yozish» (tanlov) — suhbat davom etmoqda; keyin Bobur havola xabariga Reply; so'ng tasdiqqa Reply — Azizaga
+    await say('client', C7, '/operators');
+    await press('client', C7, lastBot('client', C7.id), `card:${ids.aziza}`);
+    cb = mark('client', C7.id);
+    await press('client', C7, lastBot('client', C7.id), `pick:${ids.aziza}`);
+    const picked = botMsgsSince('client', C7.id, cb);
+    eq(picked.length, 1, 'bitta tasdiq');
+    eq(
+      picked[0]!.text,
+      "✅ Siz yana Aziza Karimova (Operator) bilan bog'landingiz — suhbat davom etmoqda.\n✍️ Savolingizni yozing.",
+      'tasdiq (mavjud suhbat)',
+    );
+    ok(isRemoveKeyboardOnly(picked[0]), 'tasdiq tugmasiz');
+    mg = mark('staff', MGR.id);
+    await say('client', C7, { text: 'Yana Boburga', replyTo: boburCard!.id });
+    eq(textsSince('staff', MGR.id, mg), '👤 Kamola · @kamola_k\nYana Boburga', 'Bobur havola xabari orqali — Bobur');
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7bobur, 'aktiv — Bobur');
+    op = mark('staff', OP1.id);
+    cb = mark('client', C7.id);
+    await say('client', C7, { text: 'Tasdiqqa Reply', replyTo: picked[0]!.id });
+    eq(textsSince('staff', OP1.id, op), '👤 Kamola · @kamola_k\nTasdiqqa Reply', 'tasdiq orqali — Aziza');
+    excludes(textsSince('client', C7.id, cb), 'Bu xabar kimga', "so'rov yo'q");
+    eq((await clientRow(C7.id)).active_conversation_id, convs.c7aziza, 'aktiv — Aziza');
+  });
+
+  await step("havola: noma'lum / yaroqsiz kod — izoh + oddiy /start (salomlashuv va rol tugmalari), suhbat yaratilmaydi; eskirgan tugma; bo'sh «Suhbatlarim»", async () => {
+    for (const payload of ['nobody', 'inv_x', 'staff_999999', 'a', 'Aziza Karimova', 'aziza_op']) {
+      const before = mark('client', C8.id);
+      await say('client', C8, `/start ${payload}`);
+      const msgs = botMsgsSince('client', C8.id, before);
+      eq(msgs.length, 1, `${payload}: bitta xabar`);
+      eq(msgs[0]!.text, `${LINK_NOT_FOUND}\n\n${welcomeFor('Jasur')}`, `${payload}: izoh + salomlashuv`);
+      ok(isRoleRowOnly(msgs[0]), `${payload}: rol tugmalari`);
+    }
+    eq((await sql`select count(*)::int as n from conversations where client_id = ${C8.id}`)[0]!.n, 0, "suhbat yaratilmadi");
+    eq((await clientRow(C8.id)).active_conversation_id, null, "aktiv suhbat yo'q");
+    // Bo'sh «Suhbatlarim» (eski tugma) — Mini App tugmasisiz
+    await say('client', C8, '💬 Suhbatlarim');
+    const empty = lastBot('client', C8.id);
+    includes(empty?.text, "Sizda hali suhbatlar yo'q", "bo'sh ro'yxat");
+    ok(isRoleRowOnly(empty), "faqat rol tugmalari (📱 Menyuni ochish yo'q)");
+    // Eskirgan / noma'lum tugma — /start ga ishora
+    const q = await forge('client', C8, lastBot('client', C8.id)!, 'eski:tugma');
+    eq(answerOf(q).text, "Bu tugma eskirgan. /start buyrug'ini yuboring.", 'eskirgan tugma javobi');
+  });
+
+  await step("eski (v1) mijoz: doimiy pastki menyu bir marta olib tashlanadi (/start), «✍️ Yozish» va havola orqali — jimgina", async () => {
+    // v1 mijozlarida pastki klaviatura qolgan (migratsiyada belgi true)
+    await sql`update clients set legacy_keyboard = true where tg_user_id = ${C8.id}`;
+    let before = mark('client', C8.id);
+    await say('client', C8, '/start');
+    let msgs = botMsgsSince('client', C8.id, before);
+    eq(msgs.length, 2, 'bir martalik izoh + /start javobi');
+    eq(msgs[0]!.text, '✨ Bot yangilandi — endi yanada sodda. Pastdagi eski menyu olib tashlandi.', 'izoh');
+    ok(isRemoveKeyboardOnly(msgs[0]), 'izoh — remove_keyboard bilan');
+    eq(msgs[1]!.text, welcomeFor('Jasur'), 'keyin odatdagi salomlashuv');
+    ok(isRoleRowOnly(msgs[1]), 'rol tugmalari');
+    eq((await clientRow(C8.id)).legacy_keyboard, false, 'belgi olib tashlandi');
+    before = mark('client', C8.id);
+    await say('client', C8, '/start');
+    eq(botMsgsSince('client', C8.id, before).length, 1, 'ikkinchi /start — bitta xabar');
+
+    // «✍️ Yozish»: tasdiqning o'zi remove_keyboard bilan — qo'shimcha izoh yo'q
+    await say('client', C8, '/operators');
+    await press('client', C8, lastBot('client', C8.id), `card:${ids.aziza}`);
+    await sql`update clients set legacy_keyboard = true where tg_user_id = ${C8.id}`;
+    before = mark('client', C8.id);
+    const q = await press('client', C8, lastBot('client', C8.id), `pick:${ids.aziza}`);
+    eq(answerOf(q).text, '✅ Tanlandi', 'callback javobi');
+    msgs = botMsgsSince('client', C8.id, before);
+    eq(msgs.length, 1, 'faqat tasdiq');
+    eq(msgs[0]!.text, "✅ Siz Aziza Karimova (Operator) bilan bog'landingiz.\n✍️ Savolingizni yozing.", 'tasdiq (yangi suhbat)');
+    ok(isRemoveKeyboardOnly(msgs[0]), 'tasdiq — remove_keyboard, tugmasiz');
+    eq((await clientRow(C8.id)).legacy_keyboard, false, 'belgi jimgina olib tashlandi');
+    eq((await clientRow(C8.id)).active_conversation_id, (await convOf(C8.id, ids.aziza))?.id, 'aktiv — Aziza');
+
+    // Havola orqali kirish ham remove_keyboard bilan — qo'shimcha izoh yo'q
+    await sql`update clients set legacy_keyboard = true where tg_user_id = ${C8.id}`;
+    before = mark('client', C8.id);
+    await say('client', C8, '/start bobur');
+    msgs = botMsgsSince('client', C8.id, before);
+    eq(msgs.length, 1, 'faqat havola xabari');
+    ok(isRemoveKeyboardOnly(msgs[0]), 'remove_keyboard');
+    eq((await clientRow(C8.id)).legacy_keyboard, false, 'belgi jimgina olib tashlandi (havola)');
+  });
+}
+
 /**
  * Qadam yarim yo'lda yiqilsa ham keyingi qadamlar uchun Aziza (OP1) yana yetib boriladigan bo'lsin: chat blokdan
  * chiqariladi va «member» update i yuboriladi (belgi olinadi, navbat yetkaziladi).
@@ -2425,14 +3078,16 @@ async function staffPresenceTests(): Promise<void> {
     before = mark('client', C2.id);
     await say('client', C2, 'Bloklangan Azizaga 2');
     excludes(textsSince('client', C2.id, before), "hozircha yetkazib bo'lmadi", 'izoh ketma-ket takrorlanmaydi');
+    before = mark('client', C2.id);
+    await say('client', C2, 'Bloklangan Azizaga 3');
+    excludes(textsSince('client', C2.id, before), "hozircha yetkazib bo'lmadi", 'izoh uchinchi xabarda ham takrorlanmaydi');
 
-    // Mini App: xabar saqlanadi, aniq sabab va ogohlantirish qaytadi
-    const s = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Bloklangan Azizaga 3' }), 200, 'app send');
-    eq(s.delivered, false, 'yetkazilmadi');
-    eq(s.undelivered_reason, 'staff_unreachable', 'sabab');
-    includes(s.warning, 'saqlandi', 'ogohlantirish');
-    const boot = expectApi(await app('client', C2, 'bootstrap'), 200, 'bootstrap');
-    eq(boot.staff.find((x: any) => x.id === ids.aziza)?.is_online, false, 'Mini App: xodim oflayn');
+    // Havola orqali kirgan mijoz ham xodimni oflayn ko'radi; Mini App (admin) ro'yxatida — oflayn
+    const offBefore = mark('client', C6.id);
+    await say('client', C6, '/start aziza');
+    includes(botMsgsSince('client', C6.id, offBefore)[0]?.text, OFFLINE_LINE, 'havola xabarida oflayn izohi (bloklangan)');
+    const adminList = expectApi(await app('staff', ADMIN, 'admin.staff.list'), 200, 'admin.staff.list');
+    eq(adminList.staff.find((x: any) => x.id === ids.aziza)?.is_online, false, 'Mini App (admin): xodim oflayn');
 
     eq(textsSince('staff', ADMIN.id, adminMark).split("to'xtatgan yoki bloklagan").length - 1, 1, 'admin bir marta ogohlantirildi');
     eq(botMsgsSince('staff', OP1.id, opMark).length, 0, 'xodimga hech narsa yetmadi');
@@ -2486,8 +3141,8 @@ async function staffPresenceTests(): Promise<void> {
       where conversation_id = ${convs.c3aziza} and text in ('navbat 1', 'navbat 2') order by id`;
     eq(queued.length, 2, 'ikkala xabar saqlandi');
     ok(queued.every((q: any) => q.staff_chat_msg_id == null), 'ikkalasi ham navbatda');
-    const boot = expectApi(await app('client', C3, 'bootstrap'), 200, 'bootstrap');
-    eq(boot.staff.find((x: any) => x.id === ids.aziza)?.is_online, false, 'Mini App: xodim oflayn');
+    const adminList = expectApi(await app('staff', ADMIN, 'admin.staff.list'), 200, 'admin.staff.list');
+    eq(adminList.staff.find((x: any) => x.id === ids.aziza)?.is_online, false, 'Mini App (admin): xodim oflayn');
 
     // Qaytish: my_chat_member → member
     let sb = mark('staff', OP1.id);
@@ -2505,6 +3160,8 @@ async function staffPresenceTests(): Promise<void> {
     sb = mark('staff', OP1.id);
     await say('staff', OP1, '/start');
     excludes(textsSince('staff', OP1.id, sb), 'navbat', 'navbat qayta yetkazilmadi');
+    // Xodim /start: mijozlar uchun shaxsiy havola va izoh
+    includes(textsSince('staff', OP1.id, sb), `🔗 Mijozlar uchun havolangiz: ${clientLink('aziza')}\n${LINK_HINT}`, '/start da mijozlar havolasi');
 
     // Qisqa variant: «member» kelmagan, xodim shunchaki /start bosadi
     adm = mark('staff', ADMIN.id);
@@ -2587,9 +3244,10 @@ async function staffPresenceTests(): Promise<void> {
   await step("avto-javob Telegram 5xx da yuborilmadi — belgi qaytariladi, keyingi xabarda bir marta yuboriladi", async () => {
     let before = mark('client', C5.id);
     await say('client', C5, `/start staff_${ids.aziza}`);
-    const card = botMsgsSince('client', C5.id, before).pop();
-    includes(card?.text, 'Aziza Karimova', 'karta');
-    await press('client', C5, card, `pick:${ids.aziza}`);
+    const linkMsgs = botMsgsSince('client', C5.id, before);
+    eq(linkMsgs.length, 1, 'havola — bitta xabar');
+    includes(linkMsgs[0]?.text, "Siz Aziza Karimova bilan bog'landingiz.", 'havola xabari');
+    eq((await clientRow(C5.id)).active_conversation_id, (await convOf(C5.id, ids.aziza))?.id, 'tanlovsiz aktiv suhbat');
     // Avto-javob ikkala urinishda ham 500 (transformer bir marta qayta urinadi)
     tg.failNext(CLIENT, 'sendMessage', { error_code: 500, description: 'Internal Server Error' }, { times: 2, when: (p) => Number(p.chat_id) === C5.id });
     const sb = mark('staff', OP1.id);
@@ -2638,8 +3296,8 @@ async function blockedAndLifecycleTests(): Promise<void> {
     const r = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c1aziza, text: 'Mini App: bloklangan' }), 200, 'send');
     eq(r.delivered, false, 'yetkazilmadi');
     includes(r.warning, 'bloklagan', 'warning');
-    // Mini App bootstrap bot_blocked belgisini tiklamasligi kerak
-    expectApi(await app('client', C1, 'bootstrap'), 200, 'bootstrap');
+    // Mijozlar Mini App i o'chirilgan: so'rov rad etiladi va bot_blocked belgisini tiklamaydi
+    eq(expectApi(await app('client', C1, 'bootstrap'), 403, 'mijoz Mini App').error, 'client_app_disabled', 'kod');
     eq((await clientRow(C1.id)).bot_blocked, true, 'Mini App ochilishi bloklash belgisini o\'zgartirmaydi');
     await postUpdate('client', tg.myChatMemberUpdate(CLIENT, C1, 'member'));
     eq((await clientRow(C1.id)).bot_blocked, false, 'member → blokdan chiqdi');
@@ -2656,7 +3314,9 @@ async function blockedAndLifecycleTests(): Promise<void> {
 
     const before = mark('client', C3.id);
     await say('client', C3, `/start staff_${ids.adminMgr}`);
-    await press('client', C3, botMsgsSince('client', C3.id, before).pop(), `pick:${ids.adminMgr}`);
+    const linkMsgs = botMsgsSince('client', C3.id, before);
+    eq(linkMsgs.length, 1, 'havola — bitta xabar');
+    eq(linkMsgs[0]!.text, linkCaption({ client: 'Guli <3', staff: 'Admin Menejer', role: '👔 Menejer' }), 'havola xabari');
     const staffBefore = mark('staff', ADMIN.id);
     await say('client', C3, 'Admin, salom');
     const rel = botMsgsSince('staff', ADMIN.id, staffBefore)[0];
@@ -2764,27 +3424,31 @@ async function blockedAndLifecycleTests(): Promise<void> {
     eq((await clientRow(C2.id)).active_conversation_id, null, 'aktiv suhbat tozalandi');
     await say('client', C2, '/operators');
     excludes(lastBot('client', C2.id)?.text, 'Sardor', 'ro\'yxatda yo\'q');
-    const bs = expectApi(await app('client', C2, 'bootstrap'), 200, 'bootstrap');
-    ok(!bs.staff.some((s: any) => s.id === ids.sardor), 'Mini App ro\'yxatida yo\'q');
-    eq(bs.conversations.find((c: any) => c.id === convs.c2sardor)?.available, false, 'suhbat available=false');
+    // O'chirib qo'yilgan xodimning shaxsiy havolasi ishlamaydi: izoh + oddiy /start (faol suhbat yo'q — salomlashuv)
+    for (const payload of ['sardor', `staff_${ids.sardor}`]) {
+      const nb = mark('client', C2.id);
+      await say('client', C2, `/start ${payload}`);
+      const nf = botMsgsSince('client', C2.id, nb);
+      eq(nf.length, 1, `${payload}: bitta xabar`);
+      eq(nf[0]!.text, `${LINK_NOT_FOUND}\n\n${welcomeFor('Vali')}`, `${payload}: izoh + salomlashuv`);
+      ok(isRoleRowOnly(nf[0]), `${payload}: rol tugmalari`);
+    }
+    eq((await clientRow(C2.id)).active_conversation_id, null, "havola aktiv suhbat yaratmadi");
     const q2 = await forge('client', C2, lastBot('client', C2.id)!, `pick:${ids.sardor}`);
     eq(answerOf(q2).show_alert, true, 'o\'chirilgan xodimni tanlab bo\'lmaydi');
   });
 
-  await step('admin (bot): akkauntni uzish — mijoz yoza olmaydi, aktiv suhbatlar tozalanadi', async () => {
-    // Eski suhbatni shunchaki ko'rish bot chatidagi yo'naltirishni o'zgartirmaydi (aktiv suhbat xodimi mavjud)
+  await step('admin (bot): akkauntni uzish — mijoz yoza olmaydi, aktiv suhbatlar tozalanadi, shaxsiy havola ishlamaydi', async () => {
     const activeBefore = (await clientRow(C1.id)).active_conversation_id;
     ok(activeBefore != null && activeBefore !== convs.c1bobur, 'aktiv — boshqa (mavjud) xodim');
-    const view = expectApi(await app('client', C1, 'conversation.open', { staffId: ids.bobur }), 200, "open Bobur (ko'rish)");
-    eq(view.conversation.id, convs.c1bobur, "o'sha suhbat");
-    eq(view.active_conversation_id, activeBefore, "ko'rish — aktiv o'zgarmadi");
-    eq((await clientRow(C1.id)).active_conversation_id, activeBefore, "bazada ham o'zgarmadi");
-    // «✍️ Yozish» (activate) — endi Bobur aktiv, bot chatida almashish haqida xabar
+    // Mijoz Boburning shaxsiy havolasi orqali qaytadi: suhbat bor — «Siz yana …», Bobur aktiv bo'ladi
     const routeBefore = mark('client', C1.id);
-    const open = expectApi(await app('client', C1, 'conversation.open', { staffId: ids.bobur, activate: true }), 200, 'open Bobur (activate)');
-    eq(open.active_conversation_id, convs.c1bobur, 'javobda aktiv');
+    await say('client', C1, '/start BOBUR');
+    const back = botMsgsSince('client', C1.id, routeBefore);
+    eq(back.length, 1, 'bitta xabar');
+    eq(back[0]!.kind, 'photo', 'rasmli');
+    eq(back[0]!.text, linkCaption({ client: 'Ali', staff: 'Bobur Aliyev', role: '👔 Menejer', existing: true }), 'mavjud suhbat izohi');
     eq((await clientRow(C1.id)).active_conversation_id, convs.c1bobur, 'aktiv — Bobur');
-    includes(textsSince('client', C1.id, routeBefore), 'Endi xabarlaringiz Bobur Aliyevga yuboriladi', 'bot chatida almashish haqida xabar');
 
     await say('staff', ADMIN, '/admin');
     const home = lastBot('staff', ADMIN.id);
@@ -2804,8 +3468,15 @@ async function blockedAndLifecycleTests(): Promise<void> {
     ok(row.invite_code, 'yangi taklif kodi');
     eq((await clientRow(C1.id)).active_conversation_id, null, 'mijozning aktiv suhbati tozalandi');
 
-    const send = await app('client', C1, 'send', { conversationId: convs.c1bobur, text: 'Bobur?' });
-    eq(expectApi(send, 404, 'uzilgan xodimga yuborish').error, 'staff_unavailable', 'kod');
+    // Akkaunti uzilgan xodimning havolasi ishlamaydi (nom saqlanadi — qayta ulanganda yana ishlaydi)
+    eq((await staffRow(ids.bobur)).link_code, 'bobur', 'havola nomi saqlanib qoldi');
+    const nb = mark('client', C1.id);
+    await say('client', C1, '/start bobur');
+    const nf = botMsgsSince('client', C1.id, nb);
+    eq(nf.length, 1, 'bitta xabar');
+    eq(nf[0]!.text, `${LINK_NOT_FOUND}\n\n${welcomeFor('Ali')}`, 'izoh + salomlashuv (faol suhbat yo\'q)');
+    ok(isRoleRowOnly(nf[0]), 'rol tugmalari');
+    eq(await convOf(C1.id, ids.bobur).then((c) => c?.id), convs.c1bobur, "yangi suhbat yaratilmadi");
     const before = mark('client', C1.id);
     await say('client', C1, { text: 'Bobur, javob bering', replyTo: inClient.boburReply });
     includes(botMsgsSince('client', C1.id, before)[0]?.text, 'Bu xodim hozir mavjud emas', "Reply orqali ham yozib bo'lmaydi");
@@ -2867,8 +3538,31 @@ async function blockedAndLifecycleTests(): Promise<void> {
     const list = expectApi(await app('staff', ADMIN, 'admin.staff.list'), 200, 'list');
     eq(JSON.stringify(list.staff.map((s: any) => s.id).sort()), JSON.stringify([ids.aziza, ids.adminMgr].sort()), 'qolgan xodimlar');
     eq(await countMessages(convs.c1bobur) > 0, true, 'suhbat tarixi saqlanib qoladi');
-    const hist = expectApi(await app('client', C1, 'messages', { conversationId: convs.c1bobur }), 200, 'o\'chirilgan xodim bilan tarix');
-    ok(hist.messages.length >= 3, 'tarix o\'qiladi');
+    // Tarix bot chatida o'qiladi («💬 Suhbatlarim»), lekin xodimga yozib bo'lmaydi
+    await say('client', C1, '💬 Suhbatlarim');
+    const chats = lastBot('client', C1.id);
+    ok(findButton(chats, `conv:${convs.c1bobur}`)?.text.startsWith('🚫'), "o'chirilgan xodim 🚫 bilan");
+    await press('client', C1, chats, `conv:${convs.c1bobur}`);
+    const hist = lastBot('client', C1.id);
+    includes(hist?.text, 'Endi Boburga', "o'chirilgan xodim bilan tarix o'qiladi");
+    includes(hist?.text, 'hozir mavjud emas', "yozib bo'lmasligi aytildi");
+
+    // O'chirilgan xodimlarning havola nomlari bo'shatiladi: havolalar ishlamaydi, nomni boshqa xodim olishi mumkin
+    eq((await staffRow(ids.bobur)).link_code, null, "Bobur nomi bo'shatildi");
+    eq((await staffRow(ids.sardor)).link_code, null, "Sardor nomi bo'shatildi");
+    for (const payload of ['bobur', `staff_${ids.bobur}`, 'SARDOR']) {
+      const nb = mark('client', C1.id);
+      await say('client', C1, `/start ${payload}`);
+      const nf = botMsgsSince('client', C1.id, nb);
+      eq(nf.length, 1, `${payload}: bitta xabar`);
+      ok(nf[0]!.text.startsWith(`${LINK_NOT_FOUND}\n\n`), `${payload}: izoh`);
+    }
+    const adminCode = (await staffRow(ids.adminMgr)).link_code as string;
+    ok(adminCode, 'Admin Menejer havola nomi');
+    const reuse = expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: ids.adminMgr, patch: { link_code: 'bobur' } }), 200, "bo'shagan nom");
+    eq(reuse.staff.link_code, 'bobur', "bo'shagan nomni boshqa xodim oldi");
+    const restore = expectApi(await app('staff', ADMIN, 'admin.staff.update', { id: ids.adminMgr, patch: { link_code: adminCode } }), 200, 'qaytarish');
+    eq(restore.staff.link_code, adminCode, 'nom qaytarildi');
   }, { allowFailedCalls: (c) => c.method === 'answerCallbackQuery' && c.error?.error_code === 400 });
 
   await step('admin (Mini App): akkauntni uzish, taklifni yangilash, rasmni olib tashlash', async () => {
@@ -2945,6 +3639,9 @@ async function rawApp(kind: Kind, user: TUser, action: string, params: Record<st
 
 async function webappSyncTests(): Promise<void> {
   await step("Mini App: sync — ro'yxat imzosi (listSig): o'zgarmagan ro'yxat qayta yuborilmaydi, list:false", async () => {
+    // C2 yana Aziza bilan yozishadi (oldingi qadamda Sardor o'chirib qo'yilib, aktiv suhbati tozalangan edi)
+    await sql`update clients set active_conversation_id = ${convs.c2aziza} where tg_user_id = ${C2.id}`;
+    await sql`delete from user_state where bot = 'client' and tg_user_id = ${C2.id}`;
     // Xodim (Aziza)
     const s1 = expectApi(await app('staff', OP1, 'sync'), 200, 'sync (imzosiz)');
     ok(Array.isArray(s1.conversations) && s1.conversations.length >= 2, "to'liq ro'yxat");
@@ -2962,7 +3659,9 @@ async function webappSyncTests(): Promise<void> {
 
     // Yangi xabar (ko'rinish va o'qilmaganlar o'zgaradi) — ro'yxat yangi imzo bilan qaytadi
     const unreadBefore = (await convRow(convs.c2aziza)).unread_staff as number;
-    expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Imzo tekshiruvi uchun xabar' }), 200, 'C2 send');
+    const sb = mark('staff', OP1.id);
+    await say('client', C2, 'Imzo tekshiruvi uchun xabar');
+    includes(textsSince('staff', OP1.id, sb), 'Imzo tekshiruvi uchun xabar', 'C2 bot orqali yozdi');
     const s3 = expectApi(await app('staff', OP1, 'sync', { listSig: s1.list_sig }), 200, 'sync (yangi xabardan keyin)');
     ok(Array.isArray(s3.conversations) && s3.list_sig !== s1.list_sig, "ro'yxat yangi imzo bilan qaytdi");
     const row = s3.conversations.find((c: any) => c.id === convs.c2aziza);
@@ -2977,17 +3676,17 @@ async function webappSyncTests(): Promise<void> {
     const s5 = expectApi(await app('staff', OP1, 'sync', { listSig: s4.list_sig }), 200, 'sync (ochiq chatdan keyin)');
     eq(s5.conversations, null, "imzo bazadagi holatga mos — ro'yxat qayta yuborilmadi");
 
-    // Mijoz: xodimning onlayn holati o'zgarsa — imzo o'zgaradi
-    const k1 = expectApi(await app('client', C2, 'sync'), 200, 'mijoz sync');
-    eq(expectApi(await app('client', C2, 'sync', { listSig: k1.list_sig }), 200, 'mijoz sync (imzo)').conversations, null, "mijoz: o'zgarmagan");
-    expectApi(await app('staff', OP1, 'status.set', { online: false }), 200, 'oflayn');
+    // Xodimning o'z holati (onlayn/oflayn) — status.set javobidagi profil (havola maydonlari bilan)
     try {
-      const k2 = expectApi(await app('client', C2, 'sync', { listSig: k1.list_sig }), 200, 'mijoz sync (oflayndan keyin)');
-      ok(Array.isArray(k2.conversations) && k2.list_sig !== k1.list_sig, "holat o'zgardi — ro'yxat qaytdi");
-      eq(k2.conversations.find((c: any) => c.id === convs.c2aziza)?.peer.is_online, false, 'peer.is_online');
+      const off = expectApi(await app('staff', OP1, 'status.set', { online: false }), 200, 'oflayn');
+      eq(off.me.is_online, false, 'oflayn');
+      eq(off.me.link_code, 'aziza', 'status.set: me.link_code');
+      eq(off.me.client_link, clientLink('aziza'), 'status.set: me.client_link');
     } finally {
       expectApi(await app('staff', OP1, 'status.set', { online: true }), 200, 'onlayn');
     }
+    // Mijozlar uchun sync ham yopiq
+    eq(expectApi(await app('client', C2, 'sync'), 403, 'mijoz sync').error, 'client_app_disabled', 'kod');
   });
 }
 
@@ -3002,15 +3701,15 @@ async function rateLimitTests(): Promise<void> {
     eq(verdicts.filter((v) => v.allowed).length, 5, "parallel 12 so'rovdan 5 tasi o'tdi");
     ok(verdicts.filter((v) => !v.allowed).every((v) => v.retryAfterSec >= 1 && v.retryAfterSec <= 60), 'retryAfterSec');
 
-    // Mijoz send: 20/daqiqa — 20-chisi o'tadi, 21-chisi 429 (Telegramga murojaat yo'q, xabar saqlanmaydi)
+    // Xodim send: 60/daqiqa — 60-chisi o'tadi, 61-chisi 429 (Telegramga murojaat yo'q, xabar saqlanmaydi)
     await roomInWindow(60, 25);
-    await seedRate(`c:${C2.id}:send`, 60, 19);
-    expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Limit ichida (20-xabar)' }), 200, '20-xabar');
+    await seedRate(`s:${ids.aziza}:send`, 60, 59);
+    expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Limit ichida (60-xabar)' }), 200, '60-xabar');
     const count = await countMessages(convs.c2aziza);
     const start = tg.calls.length;
     const nonce = 'e2e-nonce-limit-0001';
-    const r = await rawApp('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Limitdan oshdi', clientNonce: nonce });
-    eq(r.status, 429, '21-xabar — 429');
+    const r = await rawApp('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Limitdan oshdi', clientNonce: nonce });
+    eq(r.status, 429, '61-xabar — 429');
     eq(r.body?.ok, false, 'ok=false');
     eq(r.body?.error, 'rate_limited', 'kod');
     ok(Number.isInteger(r.body?.retry_after) && r.body.retry_after >= 1 && r.body.retry_after <= 60, `retry_after: ${r.body?.retry_after}`);
@@ -3018,48 +3717,44 @@ async function rateLimitTests(): Promise<void> {
     includes(r.body.message, 'Juda tez yuboryapsiz', 'xabar matni');
     eq(await countMessages(convs.c2aziza), count, 'xabar saqlanmadi');
     eq(callsSince(start).length, 0, "Telegramga murojaat yo'q");
+    // Mijozning bot chatidagi hisoblagichi alohida — C2 yozishda davom etadi
+    const sb = mark('staff', OP1.id);
+    await say('client', C2, 'Mijoz limiti alohida');
+    includes(textsSince('staff', OP1.id, sb), 'Mijoz limiti alohida', 'mijoz xabari yetkazildi');
     // Limit tugagach xuddi shu nonce bilan qayta urinish o'tadi (limitda da'vo bo'shatilgan)
     await clearRates();
-    const again = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Limitdan oshdi', clientNonce: nonce }), 200, 'qayta urinish');
+    const countAfterClient = await countMessages(convs.c2aziza);
+    const again = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Limitdan oshdi', clientNonce: nonce }), 200, 'qayta urinish');
     ok(!again.duplicate, 'yangi yuborish (takror emas)');
-    eq(await countMessages(convs.c2aziza), count + 1, 'endi saqlandi');
+    eq(await countMessages(convs.c2aziza), countAfterClient + 1, 'endi saqlandi');
 
     // Soatlik limit ham ishlaydi
-    await seedRate(`c:${C2.id}:send`, 3600, 300);
-    eq(expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'soatlik' }), 429, 'soatlik limit').error, 'rate_limited', 'kod');
+    await seedRate(`s:${ids.aziza}:send`, 3600, 1500);
+    eq(expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'soatlik' }), 429, 'soatlik limit').error, 'rate_limited', 'kod');
     await clearRates();
 
-    // Xodim send: kalit — xodim profili (60/daqiqa); mijozning hisoblagichi alohida
+    // upload: 20/daqiqa
     await roomInWindow(60, 20);
-    await seedRate(`s:${ids.aziza}:send`, 60, 60);
-    const staffStart = tg.calls.length;
-    eq(expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'xodim limiti' }), 429, 'xodim send').error, 'rate_limited', 'kod');
-    eq(callsSince(staffStart).length, 0, 'mijozga hech narsa ketmadi');
-    expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Mijoz limiti alohida' }), 200, 'mijoz send');
-    await clearRates();
-
-    // upload: 10/daqiqa
-    await roomInWindow(60, 20);
-    await seedRate(`c:${C1.id}:upload`, 60, 10);
+    await seedRate(`s:${ids.aziza}:upload`, 60, 20);
     const c1Count = await countMessages(convs.c1aziza);
     const upStart = tg.calls.length;
-    const up = await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza }, { bytes: UPLOAD_JPEG, name: 'r.jpg', type: 'image/jpeg' });
+    const up = await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza }, { bytes: UPLOAD_JPEG, name: 'r.jpg', type: 'image/jpeg' });
     eq(expectApi(up, 429, 'upload').error, 'rate_limited', 'kod');
     eq(callsSince(upStart).length, 0, 'fayl yuklanmadi');
     eq(await countMessages(convs.c1aziza), c1Count, 'saqlanmadi');
 
-    // resend («📥 Botda ochish»): 10/daqiqa
-    await seedRate(`c:${C1.id}:resend`, 60, 10);
+    // resend («📥 Botda ochish»): 15/daqiqa
+    await seedRate(`s:${ids.aziza}:resend`, 60, 15);
     const rsStart = tg.calls.length;
-    const rs = await app('client', C1, 'resend', { messageId: uploadedPhotoMsgId });
+    const rs = await app('staff', OP1, 'resend', { messageId: uploadedPhotoMsgId });
     eq(expectApi(rs, 429, 'resend').error, 'rate_limited', 'kod');
     includes(rs.body.message, "Juda ko'p so'rov", 'xabar matni');
     eq(callsSince(rsStart).length, 0, 'bot chatiga yuborilmadi');
 
     // retry (yetkazilmagan xabarni qayta yuborish) send hisoblagichidan foydalanadi
-    await seedRate(`c:${C1.id}:send`, 60, 20);
-    const own = (await sql`select id from messages where conversation_id = ${convs.c1aziza} and sender = 'client' order by id desc limit 1`)[0];
-    eq(expectApi(await app('client', C1, 'retry', { messageId: own.id }), 429, 'retry').error, 'rate_limited', 'kod');
+    await seedRate(`s:${ids.aziza}:send`, 60, 60);
+    const own = (await sql`select id from messages where conversation_id = ${convs.c1aziza} and sender = 'staff' order by id desc limit 1`)[0];
+    eq(expectApi(await app('staff', OP1, 'retry', { messageId: own.id }), 429, 'retry').error, 'rate_limited', 'kod');
     await clearRates();
   });
 
@@ -3104,63 +3799,67 @@ async function rateLimitTests(): Promise<void> {
 }
 
 async function idempotencyTests(): Promise<void> {
-  await step("Mini App: clientNonce — takroriy send/upload bir marta yetkaziladi, in_progress (409), eskirgan da'vo, noto'g'ri nonce, yuboruvchi bo'yicha alohida", async () => {
+  await step("Mini App (xodim): clientNonce — takroriy send/upload bir marta yetkaziladi, in_progress (409), eskirgan da'vo, noto'g'ri nonce, yuboruvchi bo'yicha alohida", async () => {
     await clearRates();
     try {
       // send: xuddi shu nonce bilan qayta yuborish — o'sha xabar qaytadi, qayta yetkazilmaydi
       const n = 'e2e-idem-send-0001';
       const c0 = await countMessages(convs.c2aziza);
       const s = tg.calls.length;
-      const r1 = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Idem 1', clientNonce: n }), 200, 'send (1)');
+      const r1 = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem 1', clientNonce: n }), 200, 'send (1)');
       ok(!r1.duplicate, '1-yuborish takror emas');
       eq(r1.delivered, true, 'yetkazildi');
-      const r2 = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Idem 1', clientNonce: n }), 200, 'send (takror)');
+      const r2 = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem 1', clientNonce: n }), 200, 'send (takror)');
       eq(r2.duplicate, true, 'takror');
       eq(r2.message.id, r1.message.id, "o'sha xabar qaytdi");
       eq(r2.delivered, true, 'yetkazilgan holati');
       eq(await countMessages(convs.c2aziza), c0 + 1, 'bitta yozuv');
-      eq(callsSince(s, STAFF, 'sendMessage').length, 1, 'xodimga bir marta');
+      eq(callsSince(s, CLIENT, 'sendMessage').length, 1, 'mijozga bir marta');
 
       // upload: xuddi shunday (fayl qayta yuklanmaydi)
       const n2 = 'e2e-idem-upload-0001';
       const s2 = tg.calls.length;
       const file = { bytes: UPLOAD_JPEG, name: 'i.jpg', type: 'image/jpeg' };
-      const u1 = expectApi(await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza, clientNonce: n2 }, file), 200, 'upload (1)');
+      const u1 = expectApi(await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza, clientNonce: n2 }, file), 200, 'upload (1)');
       ok(!u1.duplicate, '1-yuklash takror emas');
-      const u2 = expectApi(await appUpload('client', C1, 'upload', { conversationId: convs.c1aziza, clientNonce: n2 }, file), 200, 'upload (takror)');
+      const u2 = expectApi(await appUpload('staff', OP1, 'upload', { conversationId: convs.c1aziza, clientNonce: n2 }, file), 200, 'upload (takror)');
       eq(u2.duplicate, true, 'takror (upload)');
       eq(u2.message.id, u1.message.id, "o'sha xabar (upload)");
-      eq(callsSince(s2, STAFF, 'sendPhoto').length, 1, 'fayl bir marta yuklandi');
+      eq(callsSince(s2, CLIENT, 'sendPhoto').length, 1, 'fayl bir marta yuklandi');
 
       // Birinchi so'rov hali bajarilmoqda (da'vo bor, xabar yo'q) — 409 in_progress, hech narsa qilinmaydi
       const pending = 'e2e-idem-pending-01';
-      await sql`insert into webapp_sends (conversation_id, sender, nonce) values (${convs.c2aziza}, 'client', ${pending})`;
+      await sql`insert into webapp_sends (conversation_id, sender, nonce) values (${convs.c2aziza}, 'staff', ${pending})`;
       const c1 = await countMessages(convs.c2aziza);
       const s3 = tg.calls.length;
-      const busy = await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending });
+      const busy = await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending });
       eq(expectApi(busy, 409, 'in_progress').error, 'in_progress', 'kod');
       eq(await countMessages(convs.c2aziza), c1, 'saqlanmadi');
       eq(callsSince(s3).length, 0, "Telegramga murojaat yo'q");
 
       // Da'vo eskirgan (so'rov yarim yo'lda to'xtagan) — yangi so'rov uni oladi va yuboradi
       await sql`update webapp_sends set created_at = now() - interval '4 minutes' where conversation_id = ${convs.c2aziza} and nonce = ${pending}`;
-      const stale = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending }), 200, "eskirgan da'vo");
+      const stale = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending }), 200, "eskirgan da'vo");
       ok(!stale.duplicate, 'yangi yuborish');
       eq(await countMessages(convs.c2aziza), c1 + 1, 'saqlandi');
-      const again = expectApi(await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending }), 200, "eskirgan da'vo (takror)");
+      const again = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem kutilmoqda', clientNonce: pending }), 200, "eskirgan da'vo (takror)");
       eq(again.duplicate, true, 'endi takror');
       eq(again.message.id, stale.message.id, "o'sha xabar");
 
       // Noto'g'ri nonce — 400 bad_nonce
-      const bad = await app('client', C2, 'send', { conversationId: convs.c2aziza, text: 'x', clientNonce: 'bad!' });
+      const bad = await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'x', clientNonce: 'bad!' });
       eq(expectApi(bad, 400, "noto'g'ri nonce").error, 'bad_nonce', 'kod');
       eq(await countMessages(convs.c2aziza), c1 + 1, "noto'g'ri nonce — saqlanmadi");
 
-      // Nonce yuboruvchiga bog'langan: xodim xuddi shu nonce bilan yozsa — mustaqil yangi xabar
-      const staffSend = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem xodim', clientNonce: n }), 200, "xodim (o'sha nonce)");
+      // Nonce yuboruvchiga bog'langan: xuddi shu nonce bilan boshqa yuboruvchining (v1 dagi mijoz Mini App i)
+      // bajarilayotgan da'vosi xodimga ta'sir qilmaydi — mustaqil yangi xabar
+      const shared = 'e2e-idem-shared-01';
+      await sql`insert into webapp_sends (conversation_id, sender, nonce) values (${convs.c2aziza}, 'client', ${shared})`;
+      const staffSend = expectApi(await app('staff', OP1, 'send', { conversationId: convs.c2aziza, text: 'Idem xodim', clientNonce: shared }), 200, "xodim (o'sha nonce)");
       ok(!staffSend.duplicate, 'xodim uchun takror emas');
       eq(staffSend.message.sender, 'staff', 'xodim xabari');
-      ok(staffSend.message.id !== r1.message.id, 'boshqa xabar');
+      ok(staffSend.message.id !== r1.message.id && staffSend.message.id !== stale.message.id, 'boshqa xabar');
+      eq(await countMessages(convs.c2aziza), c1 + 2, 'saqlandi');
     } finally {
       await clearRates();
     }
@@ -3168,7 +3867,7 @@ async function idempotencyTests(): Promise<void> {
 }
 
 async function heldAndPagingTests(): Promise<void> {
-  await step("mijoz: xodim tanlanmasdan yozilgan xabarlar saqlanadi va tanlovda tartib bilan yetkaziladi (avto-javob bir marta)", async () => {
+  await step("mijoz: xodim tanlanmasdan yozilgan xabarlar saqlanadi va shaxsiy havola (/start AZIZA) orqali kirganda tartib bilan yetkaziladi (avto-javob bir marta)", async () => {
     await say('client', C4, '/start');
     let before = mark('client', C4.id);
     await say('client', C4, 'Oldindan savol: narxlar qanday?');
@@ -3178,22 +3877,33 @@ async function heldAndPagingTests(): Promise<void> {
     includes(textsSince('client', C4.id, before), 'ham saqlandi', '2-xabar ham saqlandi');
     eq((await sql`select count(*)::int as n from conversations where client_id = ${C4.id}`)[0]!.n, 0, "hali suhbat yo'q");
 
-    before = mark('client', C4.id);
-    await say('client', C4, `/start staff_${ids.aziza}`);
-    const card = botMsgsSince('client', C4.id, before).pop();
+    // Shaxsiy havola (katta harf bilan): saqlangan xabarlar /start ning o'zida xodimga ketadi, tanlov kerak emas
     const staffBefore = mark('staff', OP1.id);
     before = mark('client', C4.id);
-    await press('client', C4, card, `pick:${ids.aziza}`);
+    await say('client', C4, '/start AZIZA');
     const toStaff = botMsgsSince('staff', OP1.id, staffBefore);
     eq(
       JSON.stringify(toStaff.map((m) => m.text)),
       JSON.stringify(['🆕 👤 Nilufar · @nilu_f\nOldindan savol: narxlar qanday?', '👤 Nilufar · @nilu_f\nYana: yetkazib berish bormi?']),
       'xodimga tartib bilan, 🆕 faqat birinchisida',
     );
-    const toClient = textsSince('client', C4.id, before);
+    const got = botMsgsSince('client', C4.id, before);
     const greeting = texts.fill(texts.DEFAULT_GREETING, { name: 'Nilufar', staff: 'Aziza Karimova' });
-    eq(toClient.split(greeting).length - 1, 1, 'avto-javob bir marta');
-    includes(toClient, '2 ta xabaringiz', 'saqlangan xabarlar yuborilgani haqida');
+    eq(got.length, 2, 'mijozga: avto-javob + havola xabari');
+    eq(got[0]!.text, greeting, 'avval avto-javob (bir marta)');
+    eq(got[1]!.kind, 'photo', 'keyin rasmli havola xabari');
+    eq(
+      got[1]!.text,
+      linkCaption({
+        client: 'Nilufar',
+        staff: 'Aziza Karimova',
+        role: '👨‍💻 Operator · Katta operator',
+        last: '📨 Avvalroq yozgan 2 ta xabaringiz Aziza Karimovaga yuborildi. Javob shu yerga keladi.',
+      }),
+      "havola xabarida saqlangan xabarlar yuborilgani haqida (✍️ qatori o'rniga)",
+    );
+    includes(got[1]!.text, '2 ta xabaringiz', 'saqlangan xabarlar yuborilgani haqida');
+    ok(isRemoveKeyboardOnly(got[1]), 'tugmasiz');
     const conv = await convOf(C4.id, ids.aziza);
     eq(await countMessages(conv.id, 'client'), 2, 'ikkala xabar saqlandi');
     eq(await countMessages(conv.id, 'bot'), 1, 'bitta avto-javob');
@@ -3304,7 +4014,7 @@ async function heldAndPagingTests(): Promise<void> {
       eq(onNote.length, 1, 'bitta xabarnoma (faollashtirish)');
       includes(onNote[0]!.text, 'faollashtirildi', 'xabarnoma matni (faollashtirish)');
 
-      eq(expectApi(await app('client', C1, 'conversations'), 403, 'mijoz').error, 'staff_only', 'kod');
+      eq(expectApi(await app('client', C1, 'conversations'), 403, 'mijoz').error, 'client_app_disabled', 'kod');
       eq(expectApi(await app('staff', ADMIN, 'conversations'), 403, 'profilsiz admin').error, 'staff_only', 'kod');
       eq(expectApi(await app('staff', OP3, 'conversations', { offset: 'abc' }), 400, "noto'g'ri offset").error, 'invalid_id', 'kod');
       eq(expectApi(await app('staff', OP3, 'conversations', { search: 5 }), 400, "noto'g'ri qidiruv").error, 'bad_request', 'kod');
@@ -3358,6 +4068,7 @@ try {
   await clientBotTests();
   await miniAppTests();
   await adminBotSettingsTests();
+  await linkEntryTests();
   await staffPresenceTests();
   await blockedAndLifecycleTests();
   await webappSyncTests();

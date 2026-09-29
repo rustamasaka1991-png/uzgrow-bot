@@ -31,6 +31,8 @@ export interface Staff {
   tg_user_id: number | null;
   tg_username: string | null;
   invite_code: string | null;
+  /** Mijozlar uchun qisqa havola nomi (t.me/<mijoz_boti>?start=<link_code>) */
+  link_code: string | null;
   is_active: boolean;
   is_online: boolean;
   sort_order: number;
@@ -56,6 +58,8 @@ export interface Client {
   bot_blocked: boolean;
   created_at: Date;
   last_seen_at: Date;
+  /** v1 dagi doimiy pastki menyu hali olib tashlanmagan bo'lishi mumkin (eski mijoz; bir marta tozalanadi). */
+  legacy_keyboard?: boolean;
 }
 
 export interface Conversation {
