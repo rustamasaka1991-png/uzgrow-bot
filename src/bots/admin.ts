@@ -31,6 +31,7 @@ import {
 } from '../repo.js';
 import { ROLE_TITLES, can, getPanelRole, type PanelRole } from '../roles.js';
 import { DEFAULT_GREETING, DEFAULT_OFFLINE_NOTE, DEFAULT_WELCOME, SETTING_KEYS, STAFF_NOTICE, fill } from '../texts.js';
+import { normalizeChannel } from '../subscribe.js';
 import { FileTooBigError, downloadFile } from '../tg.js';
 import type { Role, Staff } from '../types.js';
 import { dative, dativeSuffix, esc, oneLine, roleIcon, roleLabel, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
@@ -38,6 +39,8 @@ import { requirePerm } from './panel/access.js';
 import { broadcastComposer, handleBroadcastInput, startBroadcast } from './panel/broadcast.js';
 import { complaintsComposer } from './panel/complaints.js';
 import { devHomeView, developerComposer, handleDevAddInput } from './panel/developer.js';
+import { subscribeComposer } from './panel/subscribe.js';
+import { watchComposer } from './panel/watch.js';
 import {
   EDIT_FIELDS,
   casState,
@@ -119,6 +122,20 @@ const SETTINGS: Record<SettingName, { key: string; title: string; about: string;
     about: "Xodim oflayn bo'lsa, avto-javob oxiriga qo'shiladi.",
     placeholders: '<code>{name}</code> — mijoz ismi, <code>{staff}</code> — xodim ismi',
     def: DEFAULT_OFFLINE_NOTE,
+  },
+  subchannel: {
+    key: SETTING_KEYS.subChannel,
+    title: '📢 Obuna kanali',
+    about: "Mijoz obuna bo'lishi shart bo'lgan ochiq kanal: @kanal, -100... ID yoki t.me/kanal. Maxfiy taklif havolasi (t.me/+...) bo'lmaydi — uni «🔗 Tugma havolasi» ga yozing.",
+    placeholders: 'masalan: @uzgrow_news',
+    def: '',
+  },
+  suburl: {
+    key: SETTING_KEYS.subUrl,
+    title: '🔗 Obuna tugmasi havolasi',
+    about: "«➕ Obuna bo'lish» tugmasi havolasi. Bo'sh bo'lsa kanaldan olinadi.",
+    placeholders: 'masalan: https://t.me/+xxxx',
+    def: '',
   },
 };
 
@@ -332,6 +349,9 @@ async function homeView(role: PanelRole, notice?: string): Promise<View> {
     .text('🤖 Avto-javob matni', 'adm:set:greeting')
     .row()
     .text('🕐 Oflayn izohi', 'adm:set:offline')
+    .row()
+    .text('👁 Chatlar kuzatuvi', 'wtch:list:0')
+    .text('📢 Majburiy obuna', 'sub:home')
     .row();
   if (can(role, 'broadcast') || complaints) {
     if (can(role, 'broadcast')) kb.text('📣 Mijozlarga xabar', 'adm:bc');
@@ -727,6 +747,8 @@ adminOnly.callbackQuery(/^adm:/, onAdminCallback);
 // 4) ROP/developer: shikoyatlar va ommaviy xabar; developer: developer paneli (har biri o'z huquqini tekshiradi)
 adminOnly.use(complaintsComposer);
 adminOnly.use(broadcastComposer);
+adminOnly.use(watchComposer);
+adminOnly.use(subscribeComposer);
 adminOnly.use(developerComposer);
 
 async function showHome(ctx: StaffContext, mode: 'edit' | 'new', notice?: string): Promise<void> {
@@ -1664,6 +1686,41 @@ async function handleSettingInput(ctx: StaffContext, msg: TgMessage, st: Setting
   if (!value) return reprompt(ctx, st, "Matn bo'sh bo'lmasligi kerak.", msg);
   if (value.length > SETTING_MAX) {
     return reprompt(ctx, st, `Matn juda uzun: ${value.length}/${SETTING_MAX} belgi. Qisqartirib, qayta yuboring.`, msg);
+  }
+  // 📢 Majburiy obuna kanali: @kanal / -100... / t.me/... ko'rinishida normallashtiriladi
+  if (st.key === 'subchannel') {
+    const channel = normalizeChannel(value);
+    if (!channel) {
+      return reprompt(ctx, st, "Kanal noto'g'ri. Masalan: @uzgrow_news, -1001234567890 yoki https://t.me/uzgrow_news", msg);
+    }
+    if (!(await casState(uid, st, null))) return;
+    const saved = await saveOrRestore(ctx, st, async () => {
+      await setSetting(meta.key, channel);
+      return true;
+    });
+    if (saved === undefined) return;
+    await stripKeyboard(ctx, st.promptMsgId);
+    await afterSuccess('obuna kanali saqlangani haqidagi tasdiq', () =>
+      sendHtml(ctx, `✅ <b>${meta.title}</b> saqlandi: ${esc(channel)}\n\nEndi «📢 Majburiy obuna» bo'limidan «✅ Yoqish» ni bosing.`, { markup: kb }),
+    );
+    return;
+  }
+  if (st.key === 'suburl') {
+    if (!/^https?:\/\/\S+$/i.test(value) && !/^t\.me\/\S+$/i.test(value)) {
+      return reprompt(ctx, st, "Havola noto'g'ri. Masalan: https://t.me/+xxxx", msg);
+    }
+    const url = /^t\.me\//i.test(value) ? `https://${value}` : value;
+    if (!(await casState(uid, st, null))) return;
+    const saved = await saveOrRestore(ctx, st, async () => {
+      await setSetting(meta.key, url);
+      return true;
+    });
+    if (saved === undefined) return;
+    await stripKeyboard(ctx, st.promptMsgId);
+    await afterSuccess('obuna havolasi saqlangani haqidagi tasdiq', () =>
+      sendHtml(ctx, `✅ <b>${meta.title}</b> saqlandi.`, { markup: kb }),
+    );
+    return;
   }
   if (!(await casState(uid, st, null))) return;
   const saved = await saveOrRestore(ctx, st, async () => {

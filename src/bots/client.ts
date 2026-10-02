@@ -1,7 +1,7 @@
 // Mijozlar boti (@uzgroww_bot): juda sodda — mijoz xodimning shaxsiy havolasi (t.me/<bot>?start=<nom>) orqali
 // kirsa, hech narsa tanlamasdan o'sha xodim bilan chat boshlanadi; oddiy /start da operator/menejer tanlanadi.
 // Mini App (web_app) tugmalari va doimiy pastki klaviatura yo'q.
-import { Bot, InputMediaBuilder, type Context } from 'grammy';
+import { Bot, InlineKeyboard, InputMediaBuilder, type Context } from 'grammy';
 import type {
   ForceReply,
   InlineKeyboardMarkup,
@@ -44,6 +44,7 @@ import { welcomeText } from '../texts.js';
 import { extractContent, retryOnFlood } from '../tg.js';
 import type { Client, Conversation, Role, Staff } from '../types.js';
 import { hitRateLimit, type RateRule } from '../webapp/guards.js';
+import { getSubConfig, isSubscribed, subGateHtml } from '../subscribe.js';
 import { dativeSuffix, describeError, esc, isNotModified, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
 import {
   COMPLAINT_ABANDONED_SEC,
@@ -255,6 +256,28 @@ async function dropLegacyKeyboard(ctx: Context, silent: boolean): Promise<void> 
     return false;
   });
   if (claimed && !silent) await sendHtml(ctx, T.legacyKeyboardRemoved, REMOVE_KEYBOARD);
+}
+
+/** 📢 Majburiy obuna darvozasi: yoqilgan va obuna bo'lmagan bo'lsa gate xabari yuborib false. */
+async function subGateKeyboard(): Promise<InlineKeyboard | undefined> {
+  const cfg = await getSubConfig().catch(() => null);
+  if (!cfg || !cfg.enabled || !cfg.channel) return undefined;
+  const kb = new InlineKeyboard();
+  if (cfg.url) kb.url("➕ Obuna bo'lish", cfg.url).row();
+  kb.text('✅ Tekshirish', 'sub:check');
+  return kb;
+}
+
+async function requireSubscription(ctx: Context): Promise<boolean> {
+  const from = ctx.from;
+  if (!from || from.is_bot) return true;
+  const ok = await isSubscribed(from.id).catch(() => true);
+  if (ok) return true;
+  const kb = await subGateKeyboard().catch(() => undefined);
+  await ctx
+    .reply(subGateHtml(), { parse_mode: 'HTML', ...(kb ? { reply_markup: kb } : {}) })
+    .catch(() => {});
+  return false;
 }
 
 // ───────────────────────────── Ekranlar ─────────────────────────────
@@ -1044,6 +1067,37 @@ function createClientBot(): Bot {
     const client = await upsertClient(from);
     ctxClients.set(ctx, client);
     await next();
+  });
+
+  // 📢 Majburiy obuna: xabarlar (buyruqlar ham) — obuna bo'lmagan hech narsa qila olmaydi
+  bot.on('message', async (ctx, next) => {
+    if (!(await requireSubscription(ctx))) return;
+    await next();
+  });
+
+  // 📢 Majburiy obuna: tugmalar — obuna bo'lmagan bosgan tugmasi ishlamaydi
+  bot.on('callback_query', async (ctx, next) => {
+    if (ctx.callbackQuery.data === 'sub:check') return next();
+    const from = ctx.from;
+    if (!from || from.is_bot) return;
+    const ok = await isSubscribed(from.id).catch(() => true);
+    if (ok) return next();
+    await answer(ctx, '📢 Avval kanalga obuna bo‘ling', true);
+    const kb = await subGateKeyboard().catch(() => undefined);
+    await ctx
+      .reply(subGateHtml(), { parse_mode: 'HTML', ...(kb ? { reply_markup: kb } : {}) })
+      .catch(() => {});
+  });
+
+  // ✅ Tekshirish tugmasi: obuna bo'lgan bo'lsa bot ochiladi
+  bot.callbackQuery('sub:check', async (ctx) => {
+    const ok = await isSubscribed(ctx.from.id).catch(() => true);
+    if (!ok) {
+      await answer(ctx, '❌ Hali obuna bo‘lmadingiz', true);
+      return;
+    }
+    await answer(ctx, '✅ Obuna tasdiqlandi');
+    await sendStart(ctx);
   });
 
   // Shikoyat drafti bo'lsa — xabar ENG AVVAL shikoyat sifatida qayta ishlanadi (xodimga hech qachon yuborilmaydi).

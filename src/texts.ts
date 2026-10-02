@@ -29,6 +29,10 @@ export const SETTING_KEYS = {
   offlineNote: 'offline_note',
   appUrl: 'app_url',
   placeholderPhoto: 'placeholder_photo_file_id',
+  /** 📢 Majburiy obuna: kanal (@username yoki -100... ID), tugma havolasi, yoqish ('1'). */
+  subChannel: 'sub_channel',
+  subUrl: 'sub_url',
+  subEnabled: 'sub_enabled',
 } as const;
 
 /** Mijoz /start bosganda. {name} — mijoz ismi. Oddiy matn (HTML emas). */

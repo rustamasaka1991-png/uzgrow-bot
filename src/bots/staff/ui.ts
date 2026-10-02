@@ -93,7 +93,7 @@ export const BLOCK_NOTICE = {
 } as const;
 
 /** Boshqaruv paneli tugmalari (callback_data prefikslari): admin, shikoyatlar, ommaviy xabar, developer. */
-export const PANEL_CALLBACK_RE = /^(adm|cmpl|cmpv|cmpc|cmpr|bc|dev):/;
+export const PANEL_CALLBACK_RE = /^(adm|cmpl|cmpv|cmpc|cmpr|bc|dev|wtch|sub):/;
 
 /** Telegram limitlari. */
 export const TEXT_LIMIT = 4096;

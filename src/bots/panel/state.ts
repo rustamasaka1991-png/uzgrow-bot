@@ -21,10 +21,10 @@ export type EditField = TextField | 'photo' | 'link_code';
 // Tartib muhim: stateTag() indeksni ishlatadi — yangi maydonlar faqat oxiriga qo'shiladi
 export const EDIT_FIELDS: readonly EditField[] = ['full_name', 'position', 'description', 'greeting', 'photo', 'link_code'];
 
-export type SettingName = 'welcome' | 'greeting' | 'offline';
+export type SettingName = 'welcome' | 'greeting' | 'offline' | 'subchannel' | 'suburl';
 
 export function isSettingName(s: string | undefined): s is SettingName {
-  return s === 'welcome' || s === 'greeting' || s === 'offline';
+  return s === 'welcome' || s === 'greeting' || s === 'offline' || s === 'subchannel' || s === 'suburl';
 }
 
 export interface Draft {
