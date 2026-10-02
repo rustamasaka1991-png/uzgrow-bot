@@ -4189,8 +4189,9 @@
     const listEl = h('div', { class: 'list' });
     const stateEl = h('div', { class: 'center-state', hidden: true });
     const moreWrap = h('div', { class: 'list-more', hidden: true }, h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load(false) }, "⬇️ Ko'proq yuklash"));
+    const refreshBtn = h('button', { class: 'icon-btn accent', type: 'button', 'aria-label': 'Yangilash', onclick: () => load(true) }, icon('refresh'));
     append(container, [
-      h('div', { class: 'sec-title' }, h('span', { text: '⚠️ Shikoyatlar — faqat oʻqish va hal qilish' })),
+      h('div', { class: 'sec-title' }, [h('span', { text: '⚠️ Shikoyatlar — faqat oʻqish va hal qilish' }), refreshBtn]),
       filterEl,
       listEl,
       stateEl,
@@ -4245,10 +4246,35 @@
       }
     }
 
+    function applyListRes(res, reset) {
+      const got = arr(res.complaints).map(normComplaint).filter((c) => c.id);
+      items = reset ? got : items.concat(got.filter((c) => !items.some((x) => x.id === c.id)));
+      hasMore = !!res.has_more;
+      nextOffset = num(res.next_offset) || items.length;
+      loaded = true;
+      if (root && res.total_new !== undefined) root.setBadge('complaints', num(res.total_new));
+    }
+
     async function load(reset) {
       if (loading) return;
+      // Fondagi kesh (ilovа ochilganda isitilgan) — darhol chiziladi, kutish yo'q
+      if (reset && filter === 'new') {
+        const pre = takePrefetch('complaints');
+        if (pre) {
+          try {
+            applyListRes(pre, true);
+          } catch (e) {
+            /* kesh yaroqsiz — serverdan yuklaymiz */
+          }
+          if (items.length) {
+            render();
+            return;
+          }
+        }
+      }
       loading = true;
       loadError = null;
+      refreshBtn.disabled = true;
       if (reset) {
         items = [];
         nextOffset = 0;
@@ -4256,18 +4282,14 @@
       }
       render();
       try {
-        const res = await api('complaints.list', { filter: filter, offset: reset ? 0 : nextOffset });
-        const got = arr(res.complaints).map(normComplaint).filter((c) => c.id);
-        items = reset ? got : items.concat(got.filter((c) => !items.some((x) => x.id === c.id)));
-        hasMore = !!res.has_more;
-        nextOffset = num(res.next_offset) || items.length;
-        loaded = true;
-        if (root && num(res.total_new) >= 0) root.setBadge('complaints', num(res.total_new));
+        const res = await api('complaints.list', { filter: filter, offset: reset ? 0 : nextOffset }, { timeout: 20000 });
+        applyListRes(res, reset);
       } catch (e) {
         loadError = e.message || MSG.generic;
         if (items.length) reportError(e);
       } finally {
         loading = false;
+        refreshBtn.disabled = false;
         render();
       }
     }
@@ -4392,15 +4414,31 @@
       }
     }
 
+    function applyWatchStaff(res) {
+      staff = arr(res.staff).map((s) => ({ id: num(s.id), full_name: str(s.full_name) || 'Xodim', role: s.role, is_active: s.is_active !== false, linked: !!s.linked })).filter((s) => s.id);
+      loaded = true;
+    }
+
     async function load() {
       if (loading) return;
+      const pre = takePrefetch('watchStaff');
+      if (pre) {
+        try {
+          applyWatchStaff(pre);
+        } catch (e) {
+          /* kesh yaroqsiz — serverdan yuklaymiz */
+        }
+        if (staff.length) {
+          render();
+          return;
+        }
+      }
       loading = true;
       loadError = null;
       render();
       try {
-        const res = await api('watch.staff');
-        staff = arr(res.staff).map((s) => ({ id: num(s.id), full_name: str(s.full_name) || 'Xodim', role: s.role, is_active: s.is_active !== false, linked: !!s.linked })).filter((s) => s.id);
-        loaded = true;
+        const res = await api('watch.staff', {}, { timeout: 20000 });
+        applyWatchStaff(res);
       } catch (e) {
         loadError = e.message || MSG.generic;
         if (loaded) reportError(e);
@@ -5528,6 +5566,42 @@
 
   // ═══════════════════════════ Ishga tushirish ═══════════════════════════
 
+  // ROP/developer/admin uchun og'ir ro'yxatlarni ilova ochilishi bilan fonda oldindan yuklash:
+  // foydalanuvchi tabni ochganda sovuq start (~5-10 s) kutilmaydi — kesh darhol chiziladi.
+  const PREFETCH_TTL = 120000;
+  const PC = { complaints: null, watchStaff: null };
+
+  function prefetchPrivileged() {
+    try {
+      if (S.panelRole === 'rop' || S.panelRole === 'developer') {
+        api('complaints.list', { filter: 'new', offset: 0 }, { timeout: 20000 })
+          .then((res) => {
+            PC.complaints = { at: Date.now(), res: res };
+          })
+          .catch(() => {});
+      }
+      if (S.isAdmin) {
+        api('watch.staff', {}, { timeout: 20000 })
+          .then((res) => {
+            PC.watchStaff = { at: Date.now(), res: res };
+          })
+          .catch(() => {});
+      }
+    } catch (e) {
+      /* jim — panellar ochilganda o'zi yuklaydi */
+    }
+  }
+
+  function takePrefetch(kind) {
+    const c = PC[kind];
+    if (!c || Date.now() - c.at > PREFETCH_TTL) {
+      PC[kind] = null;
+      return null;
+    }
+    PC[kind] = null;
+    return c.res;
+  }
+
   function showBootLoader() {
     clear(appEl).appendChild(
       h('div', { class: 'boot', role: 'status' }, [h('div', { class: 'boot-logo', 'aria-hidden': 'true', text: '💬' }), h('div', { text: 'Yuklanmoqda…' })]),
@@ -5557,6 +5631,8 @@
       nav.setRoot(StaffRoot());
       poller.lastBoot = 0;
       poller.plan(LIST_POLL);
+      // Og'ir panellarni fonda isitish (serverless + baza sovuq starti foydalanuvchiga sezilmasin)
+      setTimeout(prefetchPrivileged, 0);
     } catch (e) {
       clear(appEl);
       if (e.status === 401 || sessionDead || accessDead || clientDisabled) return;
