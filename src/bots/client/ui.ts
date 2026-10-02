@@ -100,6 +100,7 @@ export function helpText(): string {
     "✍️ Savolingizni shu chatga yozing — matn, rasm, fayl yoki ovozli xabar bo'lishi mumkin.",
     '💬 Xodimning javobi ham shu yerga keladi.',
     '🔄 Boshqa xodim tanlash uchun: /start',
+    '⚠️ Xodim ustidan shikoyat: /shikoyat',
   ].join('\n');
 }
 

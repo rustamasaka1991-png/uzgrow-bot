@@ -1,4 +1,4 @@
-/* Uzgrow Mini App — xodimlar va admin uchun interfeys (mijozlar uchun o'chirilgan: ular bot chatida yozadi;
+/* Uzgrow Mini App — xodimlar va panel rollari (developer / ROP / admin) uchun interfeys (mijozlar uchun o'chirilgan: ular bot chatida yozadi;
  * mijozlar boti orqali ochilsa server 403 client_app_disabled qaytaradi va "Chatga qaytish" ekrani ko'rsatiladi).
  * Vanilla JS, build bosqichisiz. Tashqi skript faqat: https://telegram.org/js/telegram-web-app.js
  * API shartnomasi: POST /api/app  { initData, action, ...params }  →  { ok: true, ... } | { ok: false, error, message }
@@ -27,9 +27,31 @@
     staffUnavailable: "Bu xodim hozir mavjud emas. Iltimos, boshqa operator yoki menejerni tanlang.",
     notStaff: "Bu bo'lim faqat xodimlar uchun. Admin bergan taklif havolasi orqali xodimlar botiga kiring.",
     undelivered: 'Saqlandi, lekin mijozga yetkazilmadi',
-    staffInactive: "Profilingiz o'chirib qo'yilgan — mijozlarga xabar yubora olmaysiz. Admin bilan bog'laning.",
+    staffInactive: "Profilingiz bloklangan — mijozlarga xabar yubora olmaysiz. Admin bilan bog'laning.",
     clientAppDisabled: 'Bu ilova faqat xodimlar uchun. Iltimos, bot chatiga qayting va shu yerda yozing.',
   };
+
+  // Panel rollari (xodimlar botidagi boshqaruv paneli; server: src/roles.ts ROLE_TITLES bilan bir xil)
+  const PANEL_ROLE_TITLES = { developer: '🛠 Developer', rop: '👑 ROP (rahbar)', admin: '⚙️ Admin' };
+  const PANEL_ROLE_HINTS = {
+    developer: 'Barcha huquqlar',
+    rop: "To'liq admin paneli, shikoyatlar va ommaviy xabar",
+    admin: 'Xodimlar, bot matnlari va statistika',
+  };
+  const COMPLAINTS_HINT = {
+    developer: 'Shikoyatlar, ommaviy xabar va developer paneli — xodimlar botidagi «⚙️ Admin panel» da.',
+    rop: 'Shikoyatlar va ommaviy xabar — xodimlar botidagi «⚙️ Admin panel» da.',
+  };
+
+  /** Serverdagi panel_role -> 'developer' | 'rop' | 'admin' (is_admin bor-u rol kelmagan eski server — 'admin'). */
+  function normPanelRole(v) {
+    return v === 'developer' || v === 'rop' || v === 'admin' ? v : 'admin';
+  }
+
+  function panelRoleTitle(role, serverTitle) {
+    if (typeof serverTitle === 'string' && serverTitle.trim() && serverTitle.length <= 64) return serverTitle.trim();
+    return PANEL_ROLE_TITLES[role] || PANEL_ROLE_TITLES.admin;
+  }
 
   function readDevInitData() {
     try {
@@ -856,6 +878,8 @@
     S.me = null;
     S.staff = [];
     S.isAdmin = false;
+    S.panelRole = null;
+    S.panelRoleTitle = '';
     A.staff = [];
     A.stats = null;
     A.loaded = false;
@@ -1037,6 +1061,9 @@
     role: null, // 'client' | 'staff'
     me: null,
     isAdmin: false,
+    // Panel roli: 'developer' | 'rop' | 'admin' | null (isAdmin — istalgan panel roli) va uning sarlavhasi
+    panelRole: null,
+    panelRoleTitle: '',
     clientBot: '', // mijozlar boti username i (shaxsiy havolalar prefiksi uchun)
     staff: [], // mijoz uchun: StaffCard[]
     convs: [], // ConvSummary[]
@@ -1220,10 +1247,19 @@
     }
   }
 
-  function applyBootstrap(res, isRefresh) {
+  /**
+   * sentSig — so'rovda yuborilgan ro'yxat imzosi (davriy bootstrap). Server ro'yxatni o'zgarmagan deb topsa
+   * `conversations: null` va xuddi shu `list_sig` ni qaytaradi — mahalliy ro'yxat saqlanadi.
+   */
+  function applyBootstrap(res, isRefresh, sentSig) {
     S.role = res.role === 'staff' ? 'staff' : 'client';
-    // Ro'yxat to'liq keldi — uning imzosi (yo'q bo'lsa null: keyingi sync to'liq ro'yxat qaytaradi)
-    S.listSig = typeof res.list_sig === 'string' ? res.list_sig : null;
+    const convs = Array.isArray(res.conversations) ? res.conversations : null;
+    const kept = !convs && !!sentSig && res.list_sig === sentSig;
+    // Ro'yxat to'liq keldi — uning imzosi (yo'q bo'lsa null: keyingi sync to'liq ro'yxat qaytaradi).
+    // O'zgarmagan (kept) — imzoga tegilmaydi (sync dagi kabi): so'rov davomida mahalliy o'zgarish uni tozalagan
+    // bo'lsa, tozaligicha qoladi. Kutilmagan null — tozalanadi, keyingi sync to'liq ro'yxat oladi.
+    if (convs) S.listSig = typeof res.list_sig === 'string' ? res.list_sig : null;
+    else if (!kept) S.listSig = null;
     if (S.role === 'client') {
       S.me = res.me || null;
       S.staff = arr(res.staff).map(normStaffCard).filter((s) => s.id);
@@ -1232,19 +1268,22 @@
       if (typeof res.client_bot === 'string' && /^[A-Za-z0-9_]{3,64}$/.test(res.client_bot)) S.clientBot = res.client_bot;
       const me = res.me ? normStaffCard(res.me) : null;
       const admin = !!res.is_admin;
+      const panelRole = admin ? normPanelRole(res.panel_role) : null;
       if (isRefresh && !me && !admin) {
         // Server odatda 403 not_staff qaytaradi; bu — qo'shimcha himoya
         accessRevoked();
         return;
       }
-      // Profil uzildi/ulandi yoki admin huquqi o'zgardi — tablar tuzilmasi boshqa, asosiy ekran qayta quriladi
-      const layoutChanged = !!isRefresh && (!!me !== !!S.me || admin !== S.isAdmin);
+      // Profil uzildi/ulandi yoki panel roli o'zgardi — tablar tuzilmasi boshqa, asosiy ekran qayta quriladi
+      const layoutChanged = !!isRefresh && (!!me !== !!S.me || admin !== S.isAdmin || panelRole !== S.panelRole);
       S.me = me;
       S.isAdmin = admin;
+      S.panelRole = panelRole;
+      S.panelRoleTitle = panelRole ? panelRoleTitle(panelRole, res.panel_role_title) : '';
       S.total = num(res.total);
       // Sahifalash: bootstrap oxirgi 100 tasini beradi. Foydalanuvchi allaqachon ko'proq yuklagan bo'lsa,
       // erishilgan joy saqlanadi (suhbatlar faqat yuqoriga ko'tariladi — hech biri o'tkazib yuborilmaydi).
-      const bootOffset = res.next_offset !== undefined ? num(res.next_offset) : arr(res.conversations).length;
+      const bootOffset = res.next_offset !== undefined ? num(res.next_offset) : convs ? convs.length : S.convs.length;
       if (!isRefresh || !S.extraConvs.size) {
         S.convNextOffset = bootOffset;
         S.convsExhausted = res.has_more !== undefined ? !res.has_more : S.total <= bootOffset;
@@ -1253,7 +1292,9 @@
         // Hammasi yuklangandan keyin yangi suhbatlar faqat ro'yxat boshida paydo bo'ladi (sync ularni olib keladi)
         if (S.convsExhausted) S.convNextOffset = Math.max(S.convNextOffset, S.total);
       }
-      setConvs(res.conversations);
+      // Ro'yxat o'zgarmagan (conversations: null) — mahalliy nusxa qoladi; jami soni yangilangan bo'lishi mumkin
+      if (convs) setConvs(convs);
+      else bus.emit('convs');
       if (layoutChanged && nav.stack.length) nav.replaceRoot(StaffRoot());
       else bus.emit('me');
       return;
@@ -1700,8 +1741,9 @@
         // Ochiq chatning o'qilmaganlari baribir 0 ko'rsatiladi (unreadOf), badge lar biroz kechroq yangilanadi.
         if (this.ticks % 3 !== 0) params.list = false;
       } else if (!chat && this.ticks - this.lastBoot >= 6) action = 'bootstrap'; // ~48 s da bir: xodimlar holati, profil
-      // Ro'yxat o'zgarmagan bo'lsa server uni qayta yubormaydi (conversations: null)
-      if (action === 'sync' && params.list !== false && S.listSig) params.listSig = S.listSig;
+      // Ro'yxat o'zgarmagan bo'lsa server uni qayta yubormaydi (conversations: null) — sync da ham, davriy
+      // bootstrap da ham (imzo bazada hisoblanadi: o'zgarmagan ro'yxat uchun ~100 bayt)
+      if ((action === 'bootstrap' || params.list !== false) && S.listSig) params.listSig = S.listSig;
       this.inflight = true;
       this.again = false;
       this.ticks++;
@@ -1711,7 +1753,7 @@
         netBanner(false);
         if (action === 'bootstrap') {
           this.lastBoot = this.ticks;
-          if (res.role === S.role) applyBootstrap(res, true);
+          if (res.role === S.role) applyBootstrap(res, true, params.listSig);
         } else {
           // Imzo ro'yxatdan OLDIN yoziladi: setConvs ichidagi mahalliy o'zgarish uni tozalasa — tozaligicha qoladi
           if (Array.isArray(res.conversations)) {
@@ -2224,7 +2266,7 @@
       // Sessiya tugagan bo'lsa navbatdagilar ham yuborilmaydi; xodim mavjud bo'lmasa — shu suhbatdagilar
       if (e.status === 401 || sessionDead) outboxFailAll();
       else if (e.code === 'staff_unavailable') outboxFailWhere((x) => x.convId === p.convId);
-      // O'chirib qo'yilgan xodim — hech bir suhbatga yoza olmaydi
+      // Bloklangan xodim — hech bir suhbatga yoza olmaydi
       else if (e.code === 'staff_inactive') {
         outboxFailAll();
         if (S.me) {
@@ -3983,7 +4025,7 @@
             ]),
             m.position ? h('div', { class: 'profile-pos', text: m.position }) : null,
           ]),
-          m.is_active === false ? h('div', { class: 'note-warn', role: 'status', text: '⛔ ' + MSG.staffInactive }) : null,
+          m.is_active === false ? h('div', { class: 'note-warn', role: 'status', text: '🚫 ' + MSG.staffInactive }) : null,
           h('div', { class: 'status-card' + (m.is_online ? ' on' : '') }, [
             h('div', { class: 'status-card-emoji', 'aria-hidden': 'true', text: m.is_online ? '🟢' : '🌙' }),
             h('div', { class: 'status-card-text' }, [
@@ -4001,7 +4043,7 @@
               class: 'link-card-sub',
               text: m.is_active
                 ? 'Shu havolani mijozlaringizga bering — ular kirishi bilan siz bilan chat boshlanadi.'
-                : "⛔ Profilingiz o'chirib qo'yilgan — havola faollashtirilgach ishlaydi.",
+                : '🚫 Profilingiz bloklangan — havola blokdan chiqarilgach ishlaydi.',
             }),
             m.client_link
               ? clientLinkBox(m.client_link, LINK_SHARE_TEXT)
@@ -4134,13 +4176,18 @@
     let loading = false;
     let loadError = null;
     const statsEl = h('div', { class: 'stats' });
+    // Rol sarlavhasi (🛠 Developer / 👑 ROP (rahbar) / ⚙️ Admin) va ROP/developer uchun shikoyatlar kartasi
+    const roleEl = h('div', { class: 'role-line', role: 'note' });
+    const complaintsEl = h('div', { class: 'complaints-wrap', hidden: true });
     const listWrap = h('div');
     const stateEl = h('div', { class: 'center-state', hidden: true });
     const refreshBtn = h('button', { class: 'icon-btn accent', type: 'button', 'aria-label': 'Yangilash', onclick: () => refresh(true) }, icon('refresh'));
 
     append(container, [
+      roleEl,
       h('div', { class: 'sec-title' }, [h('span', { text: '📊 Statistika' }), refreshBtn]),
       statsEl,
+      complaintsEl,
       h('div', { class: 'admin-actions' }, [
         h('button', { class: 'btn', type: 'button', onclick: () => openStaffForm(null) }, [icon('plus'), 'Yangi xodim']),
         h('button', { class: 'btn secondary', type: 'button', onclick: () => nav.push(SettingsScreen()) }, '📝 Bot matnlari'),
@@ -4160,12 +4207,49 @@
     let statsSig = null;
     let listSig = null;
 
+    function renderRole() {
+      clear(roleEl);
+      const role = S.panelRole;
+      roleEl.hidden = !role;
+      if (!role) return;
+      append(roleEl, [
+        h('span', { class: 'role-chip role-' + role, text: S.panelRoleTitle || PANEL_ROLE_TITLES[role] }),
+        h('span', { class: 'role-line-sub', text: PANEL_ROLE_HINTS[role] || '' }),
+      ]);
+    }
+
+    /** ROP va developer: yangi shikoyatlar soni (server can(role, 'complaints') bo'lsa complaints_new qaytaradi). */
+    function renderComplaints(s) {
+      clear(complaintsEl);
+      const role = S.panelRole;
+      const show = (role === 'rop' || role === 'developer') && !!s && s.complaints_new !== undefined && s.complaints_new !== null;
+      complaintsEl.hidden = !show;
+      if (!show) return;
+      const n = num(s.complaints_new);
+      append(complaintsEl, [
+        h('div', { class: 'stat stat-wide' + (n > 0 ? ' warn' : '') }, [
+          h('div', { class: 'stat-wide-main' }, [
+            h('span', { class: 'stat-wide-label', text: '⚠️ Yangi shikoyatlar: ' }),
+            h('span', { class: 'stat-wide-num', text: fmtNum(n) }),
+          ]),
+          s.complaints_total !== undefined && s.complaints_total !== null
+            ? h('div', { class: 'stat-sub muted', text: 'Jami: ' + fmtNum(s.complaints_total) })
+            : null,
+        ]),
+        h('p', { class: 'note complaints-hint', text: COMPLAINTS_HINT[role] || COMPLAINTS_HINT.rop }),
+        inTelegram
+          ? h('div', { class: 'complaints-actions' }, h('button', { class: 'btn sm secondary', type: 'button', onclick: closeApp }, '↩️ Botga qaytish'))
+          : null,
+      ]);
+    }
+
     function renderStats() {
-      const sig = JSON.stringify(A.stats || null);
+      const sig = JSON.stringify([A.stats || null, S.panelRole]);
       if (sig === statsSig) return;
       statsSig = sig;
       clear(statsEl);
       const s = A.stats;
+      renderComplaints(s);
       if (!s) {
         for (let i = 0; i < 4; i++) statsEl.appendChild(statCard('·', '…', '—'));
         return;
@@ -4179,7 +4263,7 @@
     }
 
     function staffRow(s) {
-      const status = s.linked ? (s.is_active ? '🟢 Faol' : "⛔ O'chirilgan") : '⏳ Ulanmagan' + (s.is_active ? '' : " · o'chirilgan");
+      const status = s.linked ? (s.is_active ? '🟢 Faol' : '🚫 Bloklangan') : '⏳ Ulanmagan' + (s.is_active ? '' : ' · bloklangan');
       const blocked = s.linked && s.bot_blocked ? " · ⚠️ botni to'xtatgan" : '';
       const sub = status + blocked + (s.position ? ' · ' + s.position : '') + (s.link_code ? ' · 🔗 ' + s.link_code : '');
       return h('button', { class: 'row', type: 'button', onclick: () => openStaffForm(s.id) }, [
@@ -4213,7 +4297,7 @@
         }
         listWrap.appendChild(h('div', { class: 'list' }, items.map(staffRow)));
       });
-      listWrap.appendChild(h('p', { class: 'legend', text: "🟢 faol · ⛔ o'chirilgan · ⏳ akkaunt ulanmagan (taklif havolasini yuboring)" }));
+      listWrap.appendChild(h('p', { class: 'legend', text: '🟢 faol · 🚫 bloklangan · ⏳ akkaunt ulanmagan (taklif havolasini yuboring)' }));
       if (A.staff.some((s) => s.linked && s.bot_blocked)) {
         listWrap.appendChild(
           h('p', { class: 'legend', text: "⚠️ botni to'xtatgan — xodim xodimlar botini bloklagan: mijozlar xabarlari unga yetib bormayapti (u /start bosishi bilan yetkaziladi)." }),
@@ -4263,6 +4347,7 @@
       renderStats();
       renderList();
     });
+    renderRole();
     renderStats();
 
     return {
@@ -4339,7 +4424,9 @@
       onInput: () => updateDirty(),
     });
     const fSort = makeField({ label: 'Tartib raqami', type: 'number', inputmode: 'numeric', placeholder: '0', hint: "Kichik raqamli xodim ro'yxatda yuqoriroq turadi.", onInput: () => updateDirty() });
-    const activeSw = switchRow('Faol', "O'chirilgan xodim mijozlarga ko'rinmaydi va unga yozib bo'lmaydi.", cur ? cur.is_active : true, () => updateDirty());
+    // Bloklash / blokdan chiqarish (is_active) — tasdiqdan keyin darhol saqlanadi, formadagi boshqa o'zgarishlarga tegmaydi
+    const blockWrap = h('div', { class: 'switch-row block-row' });
+    let blockBusy = false;
     const fLink = linkCodeField({
       label: 'Havola nomi',
       bot: clientBotName(cur && cur.client_link),
@@ -4365,7 +4452,6 @@
         fPos.get().trim(),
         fDesc.get().trim(),
         fGreet.get().trim(),
-        isNew ? true : activeSw.get(),
         isNew ? '' : fSort.get().trim(),
         fLink.get(),
       ]);
@@ -4476,6 +4562,7 @@
         cur = s;
         renderAccount();
         renderClientLink();
+        renderBlock();
       }
       if (S.me && cur && S.me.id === cur.id) refreshMe();
       return s;
@@ -4513,7 +4600,7 @@
       const link = safeClientLink(cur.client_link);
       const notes = [];
       if (!cur.linked) notes.push('⏳ Havola xodim akkaunti ulangandan keyin ishlaydi.');
-      else if (!cur.is_active) notes.push("⛔ Xodim o'chirib qo'yilgan — havola hozir ishlamaydi.");
+      else if (!cur.is_active) notes.push('🚫 Xodim bloklangan — havola hozir ishlamaydi.');
       append(clientLinkWrap, [
         link
           ? clientLinkBox(link, LINK_SHARE_TEXT)
@@ -4618,6 +4705,55 @@
         toast('🔌 Akkaunt uzildi', 'success');
       } catch (e) {
         reportError(e);
+      }
+    }
+
+    function renderBlock() {
+      if (destroyed) return;
+      clear(blockWrap);
+      if (isNew || !cur) return;
+      const blocked = !cur.is_active;
+      const btn = h(
+        'button',
+        { class: 'btn sm ' + (blocked ? 'secondary' : 'danger') + (blockBusy ? ' loading' : ''), type: 'button', disabled: blockBusy, onclick: onToggleBlock },
+        blocked ? '✅ Blokdan chiqarish' : '🚫 Bloklash',
+      );
+      append(blockWrap, [
+        h('div', { class: 'switch-row-text' }, [
+          h('div', { class: 'switch-row-title', text: blocked ? '🚫 Bloklangan' : '🟢 Faol' }),
+          h('div', {
+            class: 'switch-row-sub',
+            text: blocked
+              ? "Mijozlar xodimni menyuda ko'rmaydi va unga yoza olmaydi, u ham mijozlarga yoza olmaydi."
+              : "Bloklangan xodim mijozlarga ko'rinmaydi va unga yozib bo'lmaydi.",
+          }),
+        ]),
+        btn,
+      ]);
+    }
+
+    async function onToggleBlock() {
+      if (blockBusy || destroyed || !cur) return;
+      const block = !!cur.is_active;
+      const ok = await confirmDialog(
+        block
+          ? '«' + cur.full_name + "» bloklansinmi? Mijozlar uni ko'rmaydi va unga yoza olmaydi, u ham mijozlarga yoza olmaydi. Suhbatlar tarixi saqlanadi."
+          : '«' + cur.full_name + "» blokdan chiqarilsinmi? Mijozlar uni yana menyuda ko'radi.",
+        block ? { ok: 'Bloklash', destructive: true, title: 'Xodimni bloklash' } : { ok: 'Blokdan chiqarish', title: 'Blokdan chiqarish' },
+      );
+      if (!ok || destroyed || !cur || blockBusy) return;
+      blockBusy = true;
+      renderBlock();
+      try {
+        const res = await api('admin.staff.update', { id: cur.id, patch: { is_active: !block } });
+        await applyStaffResult(res);
+        toast(block ? '🚫 Xodim bloklandi' : '✅ Xodim blokdan chiqarildi', 'success');
+        haptic.notify('success');
+      } catch (e) {
+        reportError(e);
+      } finally {
+        blockBusy = false;
+        renderBlock();
       }
     }
 
@@ -4740,7 +4876,6 @@
         if (values.position !== cur.position) patch.position = values.position;
         if (values.description !== cur.description) patch.description = values.description;
         if (values.greeting !== (cur.greeting ? cur.greeting.trim() : null)) patch.greeting = values.greeting;
-        if (activeSw.get() !== cur.is_active) patch.is_active = activeSw.get();
         const sv = fSort.get().trim();
         const sortVal = sv === '' ? 0 : parseInt(sv, 10);
         if (sortVal !== cur.sort_order) patch.sort_order = sortVal;
@@ -4801,7 +4936,7 @@
     parts.push(h('div', { class: 'form-sec' }, fGreet.el));
     if (!isNew) {
       parts.push(h('div', { class: 'form-sec-title', text: 'Holat va tartib' }));
-      parts.push(h('div', { class: 'form-sec' }, [activeSw.el, fSort.el]));
+      parts.push(h('div', { class: 'form-sec' }, [blockWrap, fSort.el]));
       parts.push(h('div', { class: 'form-sec-title', text: 'Telegram akkaunt' }));
       parts.push(accountSec);
       parts.push(
@@ -4821,6 +4956,7 @@
       renderPhoto();
       renderAccount();
       renderClientLink();
+      renderBlock();
       updateDirty();
       if (flags.justCreated) {
         setTimeout(() => {

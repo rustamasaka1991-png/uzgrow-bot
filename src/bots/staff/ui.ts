@@ -2,6 +2,7 @@
 import { InlineKeyboard, Keyboard, type Context } from 'grammy';
 import type { Message as TgMessage, ReplyKeyboardRemove } from 'grammy/types';
 import { staffClientLink } from '../../links.js';
+import type { PanelRole } from '../../roles.js';
 import type { Staff } from '../../types.js';
 import { describeError, isNotModified, tgErrorDescription } from '../../util.js';
 
@@ -14,10 +15,44 @@ export function logError(where: string, e: unknown): void {
   console.error(`[staff] ${where}:`, describeError(e));
 }
 
+/**
+ * Amal MUVAFFAQIYATLI bajarilgandan keyingi UI (izoh, tasdiq, karta, jarayon xabari): eng yaxshi urinish.
+ * Xato (Telegram 429/5xx/timeout, ko'rinish uchun baza so'rovi) faqat logga yoziladi va xato chegarasiga (onError →
+ * «⚠️ Xatolik yuz berdi… qayta urinib ko'ring») CHIQMAYDI — aks holda xodim/admin bajarilgan amalni takrorlaydi:
+ * mijoz javobni ikki marta oladi, xodim ikki marta yaratiladi, bloklash/holat qaytib ketadi, ommaviy xabar
+ * ikki marta yuboriladi va h.k.
+ * `fallback` — asosiy ko'rinish chiqmasa, qisqa matn (u ham eng yaxshi urinish). Natija: asosiy fn bajarildimi.
+ */
+export async function afterSuccess(
+  where: string,
+  fn: () => Promise<unknown>,
+  fallback?: () => Promise<unknown>,
+): Promise<boolean> {
+  try {
+    await fn();
+    return true;
+  } catch (e) {
+    logError(`${where} (amal bajarilgan, xato e'tiborsiz)`, e);
+  }
+  if (fallback) {
+    try {
+      await fallback();
+    } catch (e) {
+      logError(`${where} (zaxira matn ham yuborilmadi)`, e);
+    }
+  }
+  return false;
+}
+
 export interface StaffFlavor {
   /** Shu Telegram akkauntiga ulangan xodim profili (ulanmagan bo'lsa null). */
   staff: Staff | null;
-  /** ADMIN_IDS ro'yxatidami. */
+  /**
+   * Boshqaruv paneli roli (src/roles.ts): developer (ADMIN_IDS env), ROP yoki admin (panel_roles). Har bir update da
+   * qayta aniqlanadi — tugma qachon chizilganidan qat'i nazar, huquq bajarilish vaqtida tekshiriladi.
+   */
+  panelRole: PanelRole | null;
+  /** Admin paneliga kira oladimi (`!!panelRole`, moslik uchun). */
   admin: boolean;
 }
 
@@ -37,10 +72,28 @@ export const MAIN_BUTTONS: readonly string[] = Object.values(BTN);
 
 export const ERROR_TEXT = "⚠️ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.";
 export const NOT_STAFF_TEXT = '👋 Bu bot faqat xodimlar uchun. Admin bergan taklif havolasi orqali kiring.';
-export const ADMIN_ONLY_TEXT = '⛔ Faqat admin uchun';
+/** Panel huquqi yetmaganda (admin paneli, shikoyatlar, ommaviy xabar, developer paneli). */
+export const NO_ACCESS_TEXT = "⛔ Ruxsat yo'q";
+/** Eski nom (moslik uchun). */
+export const ADMIN_ONLY_TEXT = NO_ACCESS_TEXT;
 export const STALE_BUTTON_TEXT = '⚠️ Bu tugma eskirgan';
 export const INACTIVE_TEXT =
-  "⛔ Profilingiz o'chirib qo'yilgan — mijozlarga xabar yuborib bo'lmaydi. Admin bilan bog'laning.";
+  "🚫 Profilingiz bloklangan — mijozlarga xabar yuborib bo'lmaydi. Admin bilan bog'laning.";
+
+/**
+ * Xodim bloklanganda / blokdan chiqarilganda unga (xodimlar boti orqali) yuboriladigan xabarnomalar (HTML).
+ * Bot admin paneli ishlatadi; Mini App admin bo'limi ham shularni ishlatishi mumkin (bir xil matn).
+ */
+export const BLOCK_NOTICE = {
+  blocked:
+    "🚫 Profilingiz <b>bloklandi</b> — mijozlar sizni menyuda ko'rmaydi va sizga yoza olmaydi, " +
+    'siz ham blokdan chiqarilguningizcha mijozlarga xabar yubora olmaysiz. Suhbatlar tarixi saqlanib qoladi.',
+  unblocked:
+    "✅ Profilingiz <b>blokdan chiqarildi</b> — mijozlar sizni yana menyuda ko'radi va siz ularga yoza olasiz.",
+} as const;
+
+/** Boshqaruv paneli tugmalari (callback_data prefikslari): admin, shikoyatlar, ommaviy xabar, developer. */
+export const PANEL_CALLBACK_RE = /^(adm|cmpl|cmpv|cmpc|cmpr|bc|dev):/;
 
 /** Telegram limitlari. */
 export const TEXT_LIMIT = 4096;

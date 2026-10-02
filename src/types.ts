@@ -43,6 +43,8 @@ export interface Staff {
   bot_blocked: boolean;
   /** Bloklashdan oldingi onlayn holati (qaytganda tiklanadi). */
   online_before_block: boolean | null;
+  /** Kutib turgan xabarlarni fonda yetkazish shu vaqtga rejalashtirilgan (src/redeliver.ts; bo'lmasa null). */
+  redeliver_at?: Date | null;
   deleted_at: Date | null;
   created_at: Date;
   updated_at: Date;
@@ -111,6 +113,11 @@ export interface Message {
   edited_at: Date | null;
   /** Yetkazish da'vo qilingan vaqt (parallel qayta yetkazishlarda takrorlanmaslik uchun). */
   delivery_claimed_at: Date | null;
+  /**
+   * Vaqtinchalik xatodan (429/5xx/tarmoq) keyin qayta urinish mumkin bo'lgan vaqt — band qilingan, lekin hozir hech
+   * kim yubormayotgan ("kutishdagi") xabar. Faol band qilishda null.
+   */
+  delivery_retry_at?: Date | null;
   /** Qayta urinib bo'lmaydigan yetkazish xatosi (masalan, 'file_too_big'). */
   delivery_error: string | null;
 }

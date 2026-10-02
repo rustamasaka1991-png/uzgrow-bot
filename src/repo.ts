@@ -1,4 +1,5 @@
 // Ma'lumotlar bazasi bilan ishlovchi barcha umumiy funksiyalar.
+import type postgres from 'postgres';
 import { db } from './db.js';
 import type {
   BotKind,
@@ -704,6 +705,10 @@ export async function updateMessageDelivery(
     staff_chat_msg_id?: number | null;
     file_id_client?: string | null;
     file_id_staff?: string | null;
+    /** Yetkazildi — band / kutish / xato belgilari tozalanadi (masalan, kechikib saqlangan 'uncertain' yozuv). */
+    delivery_claimed_at?: null;
+    delivery_retry_at?: null;
+    delivery_error?: null;
   },
 ): Promise<void> {
   const sql = db();
@@ -711,6 +716,29 @@ export async function updateMessageDelivery(
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) clean[k] = v;
   if (!Object.keys(clean).length) return;
   await sql`update messages set ${sql(clean as never, Object.keys(clean) as never)} where id = ${id}`;
+}
+
+/**
+ * Telegramga yetkazilgan (yuklangan fayl) xabar yozuvi allaqachon saqlanganmi — saqlashni qayta urinishda (oldingi
+ * INSERT bajarilgan, lekin javobi yo'qolgan bo'lishi mumkin) takroriy yozuv yaratmaslik uchun.
+ *  - `clientChatMsgId` — xodim → mijoz (mijoz chatidagi message_id);
+ *  - `staffChatId` + `staffChatMsgId` — mijoz → xodim (xodim chatidagi message_id).
+ */
+export async function findDeliveredMessage(
+  conversationId: number,
+  sender: 'client' | 'staff',
+  key: { clientChatMsgId: number } | { staffChatId: number; staffChatMsgId: number },
+): Promise<Message | null> {
+  const sql = db();
+  const cond =
+    'clientChatMsgId' in key
+      ? sql`client_chat_msg_id = ${key.clientChatMsgId}`
+      : sql`staff_chat_id = ${key.staffChatId} and staff_chat_msg_id = ${key.staffChatMsgId}`;
+  const rows = await sql<Message[]>`
+    select * from messages
+    where conversation_id = ${conversationId} and sender = ${sender} and ${cond}
+    order by id limit 1`;
+  return rows[0] ?? null;
 }
 
 export async function getMessage(id: number): Promise<Message | null> {
@@ -831,28 +859,146 @@ export interface PendingClientMessage extends Message {
 
 /** Yetkazish qancha vaqtgacha qayta urinadi (eski xabarlarni kunlar o'tib yuborish chalg'itadi). */
 const PENDING_MAX_AGE = '3 days';
-/** "Band" qilingan yetkazish shuncha vaqtdan keyin (chaqiruv to'xtab qolgan bo'lsa) yana navbatga qaytadi. */
+/**
+ * "Band" qilingan (yuborilayotgan) yetkazish shuncha vaqtdan keyin "eskirgan" hisoblanadi: chaqiruv to'xtab qolgan
+ * (funksiya 60 s dan ortiq ishlamaydi). Bunday xabar Telegramga allaqachon yetkazilgan bo'lishi mumkin (masalan,
+ * yuborildi, lekin yetkazilganlikni bazaga yozib bo'lmadi) — u AVTOMATIK QAYTA YUBORILMAYDI: navbatdan
+ * `delivery_error = 'uncertain'` bilan chiqariladi (qo'lda «🔁 Qayta yuborish» mumkin), ortidagilar to'silmaydi.
+ * Vaqtinchalik xato bilan "kutishga" o'tgan xabar (delivery_retry_at) faqat o'z retry vaqti kelganda olinadi.
+ */
 const CLAIM_TTL = '2 minutes';
+/** Eskirgan (natijasi noma'lum) yetkazish belgisi — avtomatik qayta yuborilmaydi, faqat qo'lda. */
+export const DELIVERY_UNCERTAIN = 'uncertain';
+
+// Holatlar (sender = 'client', staff_chat_msg_id is null — xodimga hali yetkazilmagan xabar):
+//  - band emas (delivery_claimed_at is null)                      → darhol olinadi;
+//  - yuborilmoqda (band, delivery_retry_at is null)              → hech kim olmaydi; TTL dan keyin — "eskirgan":
+//                                                                    navbatdan 'uncertain' bilan chiqariladi (qayta yuborilmaydi);
+//  - kutishda (band, delivery_retry_at — vaqtinchalik xatodan keyin) → faqat retry vaqti kelganda (retry_after hurmat qilinadi).
+// Suhbat ichida tartib: eskiroq xabar yetkazilmaguncha (yoki shu partiyada birga olinmaguncha) yangisi olinmaydi.
+
+type Fragment = postgres.Fragment;
+
+/** Xodimga hali yetkazilmagan (qayta urinib ko'riladigan) mijoz xabari; `a` — jadval taxallusi. */
+function pendingCond(a: string): Fragment {
+  const sql = db();
+  const t = sql(a);
+  return sql`${t}.sender = 'client' and ${t}.staff_chat_msg_id is null and ${t}.delivery_error is null
+    and ${t}.created_at > now() - ${PENDING_MAX_AGE}::interval`;
+}
 
 /**
- * Xodimga yetkazilmagan mijoz xabarlarini (eskisi birinchi) atomik "band" qilish. Parallel webhooklar bitta
- * xabarni ikki marta olmaydi (FOR UPDATE SKIP LOCKED + delivery_claimed_at).
+ * Navbat (avtomatik yetkazish) hozir band qilib olsa bo'ladimi: band emas yoki kutish vaqti kelgan. Yuborilayotgan
+ * (band, retry yo'q) xabar hech qachon avtomatik olinmaydi — TTL dan keyin ham (natijasi noma'lum, yuqoriga qarang).
+ * Hech qachon NULL emas — `not (...)` da ham ishonchli.
+ */
+function claimableCond(a: string): Fragment {
+  const sql = db();
+  const t = sql(a);
+  return sql`(${t}.delivery_claimed_at is null
+    or (${t}.delivery_retry_at is not null and ${t}.delivery_retry_at <= now()))`;
+}
+
+/** Yuborilayotgan, lekin TTL dan oshib ketgan (chaqiruv to'xtab qolgan, natija noma'lum) yetkazish. Hech qachon NULL emas. */
+function staleCond(a: string): Fragment {
+  const sql = db();
+  const t = sql(a);
+  return sql`(${t}.delivery_claimed_at is not null and ${t}.delivery_retry_at is null
+    and ${t}.delivery_claimed_at < now() - ${CLAIM_TTL}::interval)`;
+}
+
+/** Qo'lda qayta yuborish (foydalanuvchi o'zi so'radi) uchun: avtomatik navbat shartlari + eskirgan band. */
+function manualClaimableCond(a: string): Fragment {
+  const sql = db();
+  const t = sql(a);
+  return sql`(${claimableCond(a)} or ${t}.delivery_claimed_at < now() - ${CLAIM_TTL}::interval)`;
+}
+
+/**
+ * Suhbat navbati boshidagi (eng eski yetkazilmagan) `h` xabari qachon yana olinishi (yoki eskirgan deb navbatdan
+ * chiqarilishi) mumkin:
+ *  - band emas → deyarli darhol (+2 s — parallel band qilayotgan chaqiruv ulgurishi uchun);
+ *  - kutishda → retry vaqti (Telegram retry_after hurmat qilinadi);
+ *  - 60 s dan ko'p band (chaqiruv to'xtab qolgan — funksiya 60 s dan ortiq ishlamaydi) → band + TTL (eskiradi va
+ *    navbatdan 'uncertain' bilan chiqariladi — qayta yuborilmaydi);
+ *  - hozir yuborilmoqda va ortida boshqa xabar bor (`followers`) → 5 s dan keyin tekshiriladi; ortida xabar
+ *    bo'lmasa — null (yuborayotgan chaqiruvning o'zi yakunlaydi yoki kutishga qo'yib, rejalashtiradi).
+ */
+function headNextAt(h: string, followers: Fragment): Fragment {
+  const sql = db();
+  const t = sql(h);
+  return sql`case
+      when ${t}.delivery_claimed_at is null then now() + interval '2 seconds'
+      when ${t}.delivery_retry_at is not null then ${t}.delivery_retry_at
+      when ${t}.delivery_claimed_at < now() - interval '60 seconds' then ${t}.delivery_claimed_at + ${CLAIM_TTL}::interval
+      when ${followers} then now() + interval '5 seconds'
+      else null
+    end`;
+}
+
+/**
+ * Xodimning eskirgan (TTL dan oshgan, natijasi noma'lum) yetkazishlarini navbatdan chiqarish: `delivery_error =
+ * 'uncertain'`. Ular avtomatik QAYTA YUBORILMAYDI (xodim xabarni allaqachon olgan bo'lishi mumkin), lekin ortidagi
+ * xabarlarni endi to'smaydi; qo'lda «🔁 Qayta yuborish» mumkin. Chiqarilgan xabarlar id larini qaytaradi.
+ */
+export async function sweepStaleDeliveries(staffId: number): Promise<number[]> {
+  const sql = db();
+  const rows = await sql<{ id: number }[]>`
+    update messages m set delivery_error = ${DELIVERY_UNCERTAIN}, delivery_claimed_at = null, delivery_retry_at = null
+    from conversations c
+    where c.id = m.conversation_id and c.staff_id = ${staffId}
+      and ${pendingCond('m')} and ${staleCond('m')}
+    returning m.id`;
+  return rows.map((r) => Number(r.id));
+}
+
+/**
+ * Xodimga yetkazilmagan mijoz xabarlarini (eskisi birinchi) atomik "band" qilish. Parallel chaqiruvlar bitta
+ * xabarni ikki marta olmaydi (FOR UPDATE SKIP LOCKED + delivery_claimed_at). Kutishdagi xabar retry vaqti kelganda
+ * olinadi. Suhbat ichidagi tartib saqlanadi: eskiroq xabari kutishda/yuborilayotgan suhbatning keyingi xabarlari
+ * olinmaydi; eskiroq xabarni boshqa chaqiruv band qilib ulgurgan bo'lsa (SKIP LOCKED) — yangisi ham olinmaydi.
+ * Avval eskirgan (natijasi noma'lum) yetkazishlar navbatdan chiqariladi (sweepStaleDeliveries) — ular qayta
+ * yuborilmaydi va ortidagilarni to'smaydi.
  */
 export async function claimPendingForStaff(staffId: number, limit = 5): Promise<PendingClientMessage[]> {
   const sql = db();
+  const stale = await sweepStaleDeliveries(staffId);
+  if (stale.length) {
+    console.warn(
+      `[repo] xodim #${staffId}: eskirgan yetkazish(lar) navbatdan chiqarildi (qayta yuborilmaydi, qo'lda mumkin): ${stale.join(', ')}`,
+    );
+  }
   const rows = await sql<PendingClientMessage[]>`
-    with picked as (
-      select m.id from messages m
+    with cand as materialized (
+      select m.id, m.conversation_id from messages m
       join conversations c on c.id = m.conversation_id
       where c.staff_id = ${staffId}
-        and m.sender = 'client' and m.staff_chat_msg_id is null and m.delivery_error is null
-        and m.created_at > now() - ${PENDING_MAX_AGE}::interval
-        and (m.delivery_claimed_at is null or m.delivery_claimed_at < now() - ${CLAIM_TTL}::interval)
+        and ${pendingCond('m')}
+        and ${claimableCond('m')}
+        and not exists (
+          select 1 from messages o
+          where o.conversation_id = m.conversation_id and o.id < m.id
+            and ${pendingCond('o')} and not ${claimableCond('o')}
+        )
       order by m.id
       limit ${limit}
+    ),
+    locked as materialized (
+      select m.id, m.conversation_id from messages m
+      where m.id in (select id from cand)
+        and m.staff_chat_msg_id is null and m.delivery_error is null
+        and ${claimableCond('m')}
       for update of m skip locked
+    ),
+    picked as (
+      select l.id from locked l
+      where not exists (
+        select 1 from cand x
+        where x.conversation_id = l.conversation_id and x.id < l.id
+          and not exists (select 1 from locked y where y.id = x.id)
+      )
     )
-    update messages m set delivery_claimed_at = now()
+    update messages m set delivery_claimed_at = now(), delivery_retry_at = null
     from picked
     where m.id = picked.id
     returning m.*,
@@ -865,26 +1011,146 @@ export async function claimPendingForStaff(staffId: number, limit = 5): Promise<
 export async function hasPendingForStaff(staffId: number): Promise<boolean> {
   const rows = await db()`
     select 1 from messages m join conversations c on c.id = m.conversation_id
-    where c.staff_id = ${staffId}
-      and m.sender = 'client' and m.staff_chat_msg_id is null and m.delivery_error is null
-      and m.created_at > now() - ${PENDING_MAX_AGE}::interval
+    where c.staff_id = ${staffId} and ${pendingCond('m')}
     limit 1`;
   return rows.length > 0;
 }
 
 /**
+ * Yangi mijoz xabarini yuborishdan oldingi bitta arzon tekshiruv (odatdagi holatda — navbat bo'sh — yagona so'rov):
+ *  - flushable: xodimning boshqa xabarlaridan hozir band qilib olsa bo'ladigani (yoki navbatdan chiqariladigan eskirgan
+ *    yetkazish) bormi (avval navbatni yetkazish kerak);
+ *  - older: shu suhbatda shu xabardan oldingi yetkazilmagan xabar bormi (bo'lsa, yangi xabar ularning ortidan).
+ */
+export async function relayPendingState(
+  staffId: number,
+  conversationId: number,
+  messageId: number,
+): Promise<{ flushable: boolean; older: boolean }> {
+  const sql = db();
+  const rows = await sql<{ flushable: boolean; older: boolean }[]>`
+    select
+      exists (
+        select 1 from messages m join conversations c on c.id = m.conversation_id
+        where c.staff_id = ${staffId} and m.id <> ${messageId} and ${pendingCond('m')}
+          and (${claimableCond('m')} or ${staleCond('m')})
+      ) as flushable,
+      exists (
+        select 1 from messages m
+        where m.conversation_id = ${conversationId} and m.id < ${messageId} and ${pendingCond('m')}
+      ) as older`;
+  return rows[0] ?? { flushable: false, older: false };
+}
+
+/**
+ * Shu suhbatda `messageId` dan oldingi eng eski yetkazilmagan xabar (navbat boshi) va u qachon yana olinishi mumkin.
+ * `in_flight` — uni hozir tirik chaqiruv yubormoqda (band, retry yo'q, 60 s dan kam): u tez orada yetkaziladi
+ * (yangi xabar shu chaqiruvda qisqa kutib, keyin o'zi yuborilishi mumkin). Yo'q bo'lsa null — darhol yuborish mumkin.
+ */
+export async function pendingHeadBefore(
+  conversationId: number,
+  messageId: number,
+): Promise<{ id: number; next_at: Date; in_flight: boolean } | null> {
+  const sql = db();
+  const rows = await sql<{ id: number; next_at: Date; in_flight: boolean }[]>`
+    select h.id, ${headNextAt('h', sql`true`)} as next_at,
+      (h.delivery_claimed_at is not null and h.delivery_retry_at is null
+        and h.delivery_claimed_at >= now() - interval '60 seconds') as in_flight
+    from messages h
+    where h.conversation_id = ${conversationId} and h.id < ${messageId} and ${pendingCond('h')}
+    order by h.id
+    limit 1`;
+  return rows[0] ?? null;
+}
+
+/**
+ * Xodimning navbatida keyingi urinish qachon kerak (har bir suhbat navbati boshiga qarab, eng ertasi).
+ * null — kutadigan hech narsa yo'q (yoki hammasi hozir yuborilmoqda va ortida xabar yo'q).
+ */
+export async function nextRedeliveryAt(staffId: number): Promise<Date | null> {
+  const sql = db();
+  const rows = await sql<{ next_at: Date | null }[]>`
+    select min(${headNextAt(
+      'h',
+      sql`exists (select 1 from messages f where f.conversation_id = h.conversation_id and f.id > h.id and ${pendingCond('f')})`,
+    )}) as next_at
+    from (
+      select distinct on (m.conversation_id) m.id, m.conversation_id, m.delivery_claimed_at, m.delivery_retry_at
+      from messages m join conversations c on c.id = m.conversation_id
+      where c.staff_id = ${staffId} and ${pendingCond('m')}
+      order by m.conversation_id, m.id
+    ) h`;
+  return rows[0]?.next_at ?? null;
+}
+
+/**
+ * Vaqtinchalik xato: band qilingan xabarlarni "kutishga" o'tkazish — band saqlanadi (boshqalar darhol olmaydi),
+ * `delaySec` dan keyin (aynan shu vaqtda — TTL bunga ta'sir qilmaydi) navbat ularni yana oladi. Retry vaqtini
+ * qaytaradi (hech biri mos kelmasa null).
+ */
+export async function parkDeliveries(ids: readonly number[], delaySec: number): Promise<Date | null> {
+  if (!ids.length) return null;
+  const sql = db();
+  const secs = Math.max(1, Math.min(Math.ceil(delaySec), 3600));
+  const rows = await sql<{ retry_at: Date }[]>`
+    update messages set delivery_claimed_at = now(), delivery_retry_at = now() + make_interval(secs => ${secs})
+    where id = any(${sql.array([...ids])}::bigint[])
+      and delivery_claimed_at is not null and staff_chat_msg_id is null and delivery_error is null
+    returning delivery_retry_at as retry_at`;
+  let min: Date | null = null;
+  for (const r of rows) if (r.retry_at && (!min || r.retry_at < min)) min = r.retry_at;
+  return min;
+}
+
+/**
+ * Fonda yetkazishni `at` ga rejalashtirish belgisi (takroriy chaqiruvlarning oldini olish). Shu yoki undan oldingi
+ * vaqtga rejalashtirilgan (va 90 s dan ortiq eskirmagan) fon yetkazish bo'lsa — false (yangi chaqiruv kerak emas).
+ */
+export async function markRedeliveryScheduled(staffId: number, at: Date): Promise<boolean> {
+  const rows = await db()`
+    update staff set redeliver_at = ${at}
+    where id = ${staffId}
+      and (redeliver_at is null or redeliver_at > ${at} or redeliver_at < now() - interval '90 seconds')
+    returning id`;
+  return rows.length > 0;
+}
+
+/**
+ * Zanjir to'xtadi (hop cheklovi): o'zi qo'ygan `at` belgisini olib tashlash — keyingi hodisa yangi zanjir boshlay olsin
+ * (aks holda belgi 90 s gacha yangi so'rovlarni "allaqachon rejalashtirilgan" deb rad etadi).
+ */
+export async function releaseRedeliveryMark(staffId: number, at: Date): Promise<void> {
+  await db()`update staff set redeliver_at = null where id = ${staffId} and redeliver_at = ${at}`;
+}
+
+/** Vaqti kelgan fon yetkazish belgisini olib tashlash (fon yetkazish ishga tushganda). */
+export async function clearDueRedelivery(staffId: number): Promise<void> {
+  await db()`update staff set redeliver_at = null where id = ${staffId} and redeliver_at <= now() + interval '1 second'`;
+}
+
+/**
  * Bitta xabarni qo'lda qayta yuborish uchun band qilish (ikki marta bosilganda takrorlanmasin).
- * target: 'staff' — mijoz xabarini xodimga, 'client' — xodim xabarini mijozga. Allaqachon yetkazilgan
- * yoki hozir boshqa chaqiruv yuborayotgan bo'lsa null.
+ * target: 'staff' — mijoz xabarini xodimga, 'client' — xodim xabarini mijozga. Allaqachon yetkazilgan,
+ * hozir boshqa chaqiruv yuborayotgan yoki (xodimga) shu suhbatda undan eskiroq yetkazilmagan xabar bo'lsa null.
  */
 export async function claimMessageDelivery(id: number, target: BotKind): Promise<Message | null> {
   const sql = db();
+  // Qo'lda qayta yuborish oldingi xatoni (masalan, 'uncertain') bekor qiladi: natija qaytadan baholanadi — vaqtinchalik
+  // xatoda xabar yana avtomatik navbatga qaytadi
   const rows = await sql<Message[]>`
-    update messages set delivery_claimed_at = now()
-    where id = ${id}
-      and ${target === 'staff' ? sql`sender = 'client' and staff_chat_msg_id is null` : sql`sender = 'staff' and client_chat_msg_id is null`}
-      and (delivery_claimed_at is null or delivery_claimed_at < now() - ${CLAIM_TTL}::interval)
-    returning *`;
+    update messages m set delivery_claimed_at = now(), delivery_retry_at = null, delivery_error = null
+    where m.id = ${id}
+      and ${
+        target === 'staff'
+          ? sql`m.sender = 'client' and m.staff_chat_msg_id is null
+              and not exists (
+                select 1 from messages o
+                where o.conversation_id = m.conversation_id and o.id < m.id and ${pendingCond('o')}
+              )`
+          : sql`m.sender = 'staff' and m.client_chat_msg_id is null`
+      }
+      and ${manualClaimableCond('m')}
+    returning m.*`;
   return rows[0] ?? null;
 }
 
@@ -892,12 +1158,14 @@ export async function claimMessageDelivery(id: number, target: BotKind): Promise
 export async function releaseDeliveryClaims(ids: readonly number[]): Promise<void> {
   if (!ids.length) return;
   const sql = db();
-  await sql`update messages set delivery_claimed_at = null where id = any(${sql.array([...ids])}::bigint[])`;
+  await sql`
+    update messages set delivery_claimed_at = null, delivery_retry_at = null
+    where id = any(${sql.array([...ids])}::bigint[])`;
 }
 
 /** Qayta urinib bo'lmaydigan yetkazish xatosi (navbatdan chiqariladi). */
 export async function setDeliveryError(id: number, error: string): Promise<void> {
-  await db()`update messages set delivery_error = ${error}, delivery_claimed_at = null where id = ${id}`;
+  await db()`update messages set delivery_error = ${error}, delivery_claimed_at = null, delivery_retry_at = null where id = ${id}`;
 }
 
 // ───────────────────────────── Tahrirlar ─────────────────────────────

@@ -39,6 +39,52 @@ interface ClientState {
   held?: HeldItem[];
   /** Botda aniq tanlangan suhbat (vaqti — user_state.updated_at). */
   sel?: number;
+  /** Shikoyat: joriy draftning so'rov xabari (✍️ … ustidan shikoyatingizni yozing) id si. */
+  cmpMsg?: number;
+  /** Shikoyat: shikoyat sifatida qabul qilingan albom (media group) — qolgan qismlari hech kimga yuborilmaydi. */
+  cmpAlbum?: string;
+  /** Shikoyatdan keyingi himoya: shikoyat qilingan xodimga ketayotgan xabarlar vaqtincha ushlanadi. */
+  cmpGuard?: ComplaintGuard;
+}
+
+/**
+ * Shikoyat yuborilgandan (yoki shikoyat oynasi yopilgandan) keyingi himoya: shu muddat ichida SHIKOYAT QILINGAN
+ * xodimga ketayotgan xabarlar unga yuborilmaydi (Telegram bo'lib yuborgan uzun shikoyatning davomi, izohsiz isbot
+ * rasmi, parallel kelgan xabar). Boshqa xodimlarga xabarlar odatdagidek ketadi.
+ */
+export interface ComplaintGuard {
+  /** Yuborilgan shikoyat id si — matnli xabar shunga qo'shiladi; null — xabar faqat hech kimga yuborilmaydi. */
+  id: number | null;
+  /** Shikoyat qilingan xodim (staff.id). */
+  staff: number;
+  /** Amal qilish muddati (ms, epoch). */
+  until: number;
+  /**
+   * Mijoz chatidagi xabar id si: shundan boshlab (mijoz izohni ko'rgandan keyin) yozilgan xabarlar ushlanmaydi.
+   * Faqat id=null himoyada (parallel kelgan xabarlar uchun) qo'yiladi.
+   */
+  beforeMsg?: number;
+}
+
+function guardOf(state: unknown): ComplaintGuard | null {
+  const g = (state as ClientState | null)?.cmpGuard as Record<string, unknown> | undefined;
+  if (!g || typeof g !== 'object') return null;
+  const staff = Number(g.staff);
+  const until = Number(g.until);
+  if (!Number.isSafeInteger(staff) || !Number.isFinite(until) || until <= Date.now()) return null;
+  const id = g.id == null ? null : Number(g.id);
+  const beforeMsg = g.beforeMsg == null ? undefined : Number(g.beforeMsg);
+  return {
+    id: id != null && Number.isSafeInteger(id) ? id : null,
+    staff,
+    until,
+    ...(beforeMsg != null && Number.isSafeInteger(beforeMsg) ? { beforeMsg } : {}),
+  };
+}
+
+/** Himoya shu xabarga (mijoz chatidagi id) va shu xodimga amal qiladimi. */
+export function guardApplies(g: ComplaintGuard | null, staffId: number, msgId: number): g is ComplaintGuard {
+  return !!g && g.staff === staffId && g.until > Date.now() && (g.beforeMsg == null || msgId < g.beforeMsg);
 }
 
 export function heldItemFrom(msg: TgMessage, content: Content): HeldItem {
@@ -96,7 +142,8 @@ export async function holdMessages(clientId: number, items: HeldItem[]): Promise
       state = case
         when us.updated_at <= now() - interval '30 minutes'
           or jsonb_typeof(us.state -> 'held') is distinct from 'array'
-          then excluded.state
+          -- shikoyat belgilari (cmpGuard / cmpMsg / cmpAlbum) saqlanadi
+          then excluded.state || (us.state - 'held' - 'sel')
         when jsonb_array_length(us.state -> 'held') + ${items.length} > ${HELD_MAX}
           then us.state
         else jsonb_set(us.state, '{held}', (us.state -> 'held') || (excluded.state -> 'held'))
@@ -120,11 +167,17 @@ export async function takeHeld(clientId: number, selectedConvId: number | null):
   const rows = await sql<{ state: unknown; fresh: boolean }[]>`
     delete from user_state where bot = 'client' and tg_user_id = ${clientId}
     returning state, (updated_at > now() - interval '30 minutes') as fresh`;
-  if (selectedConvId != null) {
+  // Amaldagi shikoyat himoyasi yo'qolmaydi (aks holda keyingi xabar shikoyat qilingan xodimning o'ziga ketardi)
+  const guard = guardOf(rows[0]?.state);
+  const keep: ClientState = {
+    ...(selectedConvId != null ? { sel: selectedConvId } : {}),
+    ...(guard ? { cmpGuard: guard } : {}),
+  };
+  if (Object.keys(keep).length) {
     // Oraliqda saqlangan xabar bo'lsa (juda kam holat) — u yo'qolmaydi: kalitlar birlashtiriladi
     await sql`
       insert into user_state (bot, tg_user_id, state, updated_at)
-      values ('client', ${clientId}, ${sql.json({ sel: selectedConvId } as never)}, now())
+      values ('client', ${clientId}, ${sql.json(keep as never)}, now())
       on conflict (bot, tg_user_id) do update set state = user_state.state || excluded.state, updated_at = now()`;
   }
   const r = rows[0];
@@ -134,12 +187,143 @@ export async function takeHeld(clientId: number, selectedConvId: number | null):
 /**
  * Tanlov belgisini o'chirish: mijoz shu suhbatga yozgach, chatdagi oxirgi xabar shu suhbatniki bo'ladi va belgi
  * endi kerak emas. Faqat aynan shu belgi bo'lsa o'chiriladi (oraliqda saqlangan xabar yoki yangi tanlov qoladi).
+ * Shikoyat belgilari (cmpMsg/cmpAlbum) hisobga olinmaydi — ular vaqtinchalik va bu paytda draft yo'q.
+ * Shikoyat himoyasi (cmpGuard) bo'lsa — yozuv o'chirilmaydi, faqat `sel` olib tashlanadi.
  */
 export async function clearSelection(clientId: number, selectedConvId: number): Promise<void> {
   const sql = db();
+  const onlySel = sql`(state - 'cmpMsg' - 'cmpAlbum' - 'cmpGuard') = ${sql.json({ sel: selectedConvId } as never)}`;
   await sql`
-    delete from user_state
-    where bot = 'client' and tg_user_id = ${clientId} and state = ${sql.json({ sel: selectedConvId } as never)}`;
+    with d as (
+      delete from user_state
+      where bot = 'client' and tg_user_id = ${clientId} and ${onlySel} and not (state ? 'cmpGuard')
+      returning 1
+    )
+    update user_state set state = state - 'sel'
+    where bot = 'client' and tg_user_id = ${clientId} and ${onlySel} and (state ? 'cmpGuard')`;
+}
+
+// ───────────────────────────── Shikoyat belgilari ─────────────────────────────
+
+export interface ComplaintMarks {
+  /** Joriy draftning so'rov xabari id si (mijoz chatida). */
+  promptMsgId: number | null;
+  /** Shikoyat sifatida qabul qilingan (yoki shikoyat draftida kelgan) oxirgi albom. */
+  album: string | null;
+}
+
+export async function getComplaintMarks(clientId: number): Promise<ComplaintMarks> {
+  const rows = await db()<{ state: unknown }[]>`
+    select state from user_state where bot = 'client' and tg_user_id = ${clientId}`;
+  const s = (rows[0]?.state ?? null) as ClientState | null;
+  return {
+    promptMsgId: typeof s?.cmpMsg === 'number' ? s.cmpMsg : null,
+    album: typeof s?.cmpAlbum === 'string' ? s.cmpAlbum : null,
+  };
+}
+
+/**
+ * Holatga kalit(lar) qo'shish. updated_at ataylab yangilanmaydi — u `sel` (tanlov) vaqti va saqlangan xabarlar
+ * muddati uchun ishlatiladi. Yangi yozuvda boshqa kalitlar yo'q, shuning uchun now() hech narsaga ta'sir qilmaydi.
+ */
+async function mergeClientState(clientId: number, patch: ClientState): Promise<void> {
+  const sql = db();
+  await sql`
+    insert into user_state (bot, tg_user_id, state, updated_at)
+    values ('client', ${clientId}, ${sql.json(patch as never)}, now())
+    on conflict (bot, tg_user_id) do update set state = user_state.state || excluded.state`;
+}
+
+export function setComplaintPrompt(clientId: number, msgId: number): Promise<void> {
+  return mergeClientState(clientId, { cmpMsg: msgId });
+}
+
+export function markComplaintAlbum(clientId: number, group: string): Promise<void> {
+  return mergeClientState(clientId, { cmpAlbum: group });
+}
+
+/**
+ * Shikoyat himoyasini (va albom belgisini) BITTA yozuvda qo'yish — draft o'chirilishidan / yuborilishidan OLDIN
+ * chaqiriladi: parallel kelgan xabar draftni topmasa ham himoyani topadi.
+ */
+export function setComplaintGuard(clientId: number, guard: ComplaintGuard, album?: string): Promise<void> {
+  return mergeClientState(clientId, { cmpGuard: guard, ...(album ? { cmpAlbum: album } : {}) });
+}
+
+/**
+ * id=null himoyani mijoz chatidagi izoh xabari bilan chegaralash: izohdan keyin (uni o'qib) yozilgan xabarlar
+ * odatdagidek ketadi. Faqat hali o'sha (id=null, shu xodim) himoya bo'lsa.
+ */
+export async function boundComplaintGuard(clientId: number, staffId: number, beforeMsg: number): Promise<void> {
+  const sql = db();
+  await sql`
+    update user_state set state = jsonb_set(state, '{cmpGuard,beforeMsg}', to_jsonb(${beforeMsg}::bigint))
+    where bot = 'client' and tg_user_id = ${clientId}
+      and jsonb_typeof(state -> 'cmpGuard') = 'object'
+      and (state -> 'cmpGuard' ->> 'staff') = ${String(staffId)}
+      and coalesce(state -> 'cmpGuard' ->> 'id', '') = ''`;
+}
+
+/**
+ * Shikoyat himoyasini olib tashlash — mijoz shu xodimga yozishni o'zi aniq tanladi (✍️ / ↩️ tugmasi, shaxsiy havola).
+ * staffId berilsa — faqat o'sha xodim himoyasi.
+ */
+export async function clearComplaintGuard(clientId: number, staffId?: number): Promise<void> {
+  const sql = db();
+  await sql`
+    update user_state set state = state - 'cmpGuard'
+    where bot = 'client' and tg_user_id = ${clientId} and (state ? 'cmpGuard')
+      ${staffId != null ? sql`and (state -> 'cmpGuard' ->> 'staff') = ${String(staffId)}` : sql``}`;
+}
+
+/**
+ * Mijozda shikoyat drafti bormi (muddati o'tgani ham). Har bir kiruvchi xabarda chaqiriladi — odatdagi holatda
+ * (draft yo'q) bitta yengil so'rov (complaints_client_draft_idx); muddatni getActiveDraft (src/complaints.ts) aniqlaydi.
+ */
+export async function hasComplaintDraft(clientId: number): Promise<boolean> {
+  return (await complaintDraftAgeSec(clientId)) !== null;
+}
+
+/**
+ * Mijozning eng yangi shikoyat draftining yoshi (soniya; muddati o'tgani ham), draft yo'q bo'lsa null. Odatdagi
+ * holatda (draft yo'q) bitta yengil so'rov (complaints_client_draft_idx).
+ */
+export async function complaintDraftAgeSec(clientId: number): Promise<number | null> {
+  return (await complaintDraftInfo(clientId))?.ageSec ?? null;
+}
+
+/** Eng yangi shikoyat draftining yoshi (soniya) va xodimi (muddati o'tgani ham); draft yo'q bo'lsa null. */
+export async function complaintDraftInfo(clientId: number): Promise<{ ageSec: number; staffId: number } | null> {
+  try {
+    const rows = await db()<{ age: number | null; staff_id: number | null }[]>`
+      select extract(epoch from (now() - created_at))::float8 as age, staff_id
+      from complaints where client_id = ${clientId} and status = 'draft'
+      order by created_at desc, id desc
+      limit 1`;
+    const r = rows[0];
+    return r && r.age != null ? { ageSec: Math.max(0, Number(r.age)), staffId: Number(r.staff_id) } : null;
+  } catch (e) {
+    // Jadval hali yo'q (migratsiya qo'llanmagan) — demak draft ham yo'q: mijoz xabarlari to'xtab qolmasin
+    if ((e as { code?: unknown } | null)?.code === '42P01') return null;
+    throw e;
+  }
+}
+
+/**
+ * Shikoyat uchun: mijozning shu xodim bilan xabari bor suhbati (xodim hozir bloklangan/o'chirilgan bo'lsa ham).
+ * Bunday suhbat bo'lmasa null (begona xodim ustidan shikoyat yo'q).
+ */
+export async function complaintTarget(
+  clientId: number,
+  staffId: number,
+): Promise<{ conversationId: number; staffFullName: string } | null> {
+  if (!Number.isSafeInteger(staffId) || staffId <= 0) return null;
+  const rows = await db()<{ conv_id: number; full_name: string }[]>`
+    select c.id as conv_id, s.full_name from conversations c join staff s on s.id = c.staff_id
+    where c.client_id = ${clientId} and c.staff_id = ${staffId} and c.last_message_at is not null
+    limit 1`;
+  const r = rows[0];
+  return r ? { conversationId: Number(r.conv_id), staffFullName: r.full_name } : null;
 }
 
 // ───────────────────────────── Botning o'z xabaridan suhbatni aniqlash ─────────────────────────────
@@ -243,16 +427,28 @@ export interface RouteInfo {
   /** Botda oxirgi marta aniq tanlangan suhbat va vaqti. */
   selConvId: number | null;
   selAt: Date | null;
+  /** Amaldagi shikoyat himoyasi (muddati o'tmagan) — guardApplies bilan tekshiriladi. */
+  cmpGuard: ComplaintGuard | null;
 }
 
 /** Bitta so'rovda: oxirgi ko'rsatilgan xabar suhbati + mijoz holati (saqlangan xabarlar, tanlov). */
 export async function loadRouteInfo(clientId: number): Promise<RouteInfo> {
   const sql = db();
   const rows = await sql<
-    { last_conv_id: number | null; last_at: Date | null; state: unknown; state_at: Date | null; fresh: boolean | null }[]
+    {
+      last_conv_id: number | null;
+      last_at: Date | null;
+      state: unknown;
+      state_at: Date | null;
+      fresh: boolean | null;
+      guard: unknown;
+    }[]
   >`
     select ls.conversation_id as last_conv_id, ls.created_at as last_at,
-      st.state, st.updated_at as state_at, (st.updated_at > now() - interval '30 minutes') as fresh
+      st.state, st.updated_at as state_at, (st.updated_at > now() - interval '30 minutes') as fresh,
+      -- shikoyat himoyasi updated_at dan qat'i nazar (mergeClientState uni yangilamaydi)
+      (select jsonb_build_object('cmpGuard', u.state -> 'cmpGuard') from user_state u
+        where u.bot = 'client' and u.tg_user_id = ${clientId} and (u.state ? 'cmpGuard')) as guard
     from (select 1) as one
     left join lateral (
       select x.conversation_id, x.created_at
@@ -278,6 +474,7 @@ export async function loadRouteInfo(clientId: number): Promise<RouteInfo> {
     hasHeld: !!r?.fresh && freshHeld(heldOf(state)).length > 0,
     selConvId: sel,
     selAt: sel != null ? (r?.state_at ?? null) : null,
+    cmpGuard: guardOf(r?.guard ?? null),
   };
 }
 

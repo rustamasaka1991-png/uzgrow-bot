@@ -5,7 +5,7 @@
  * Sxema versiyasi: SCHEMA_SQL o'zgarganda oshiriladi. Ilova ishga tushganda bazadagi versiya eski bo'lsa
  * (deploy migratsiyadan oldin chiqib qolsa) — idempotent migratsiya avtomatik bir marta bajariladi (ensureSchema).
  */
-export const SCHEMA_VERSION = '2026-09-28.2';
+export const SCHEMA_VERSION = '2026-09-30.2';
 
 export const SCHEMA_SQL = /* sql */ `
 create table if not exists staff (
@@ -135,10 +135,15 @@ alter table messages add column if not exists edited_at timestamptz;
 alter table messages add column if not exists delivery_claimed_at timestamptz;
 -- Yetkazish qayta urinib bo'lmaydigan sabab bilan muvaffaqiyatsiz bo'lsa (masalan, fayl juda katta)
 alter table messages add column if not exists delivery_error text;
+-- Vaqtinchalik xatodan (Telegram 429 retry_after, 5xx, tarmoq) keyin xodimga qayta yetkazish mumkin bo'lgan vaqt.
+-- Band (delivery_claimed_at) saqlanadi; shu vaqt kelganda (2 daqiqalik TTL ni kutmasdan) navbat uni yana oladi.
+alter table messages add column if not exists delivery_retry_at timestamptz;
 -- Xodim xodimlar botini bloklagan/to'xtatgan (xabarlar yetkazilmaydi, u qaytganda yetkaziladi)
 alter table staff add column if not exists bot_blocked boolean not null default false;
 -- Bloklashdan oldingi onlayn holati (qaytganda tiklanadi)
 alter table staff add column if not exists online_before_block boolean;
+-- Kutib turgan xabarlarni fonda yetkazish (POST /api/redeliver) shu vaqtga rejalashtirilgan (takroriy chaqiruvlarsiz)
+alter table staff add column if not exists redeliver_at timestamptz;
 -- Xodim aktiv suhbatni oxirgi marta aniq tanlagan vaqt (Reply'siz xabar kimga ketishini aniqlash uchun)
 alter table staff add column if not exists active_set_at timestamptz;
 -- Mijozlar uchun qisqa havola nomi: https://t.me/<mijoz_boti>?start=<link_code> (masalan "aziza")
@@ -178,6 +183,50 @@ create index if not exists messages_edited_idx on messages (conversation_id, edi
 create index if not exists messages_pending_staff_idx on messages (conversation_id, id)
   where sender = 'client' and staff_chat_msg_id is null and delivery_error is null;
 
+-- Panel rollari: admin va ROP (rahbar). Developer(lar) — ADMIN_IDS env dagi Telegram ID lar (bazada emas).
+create table if not exists panel_roles (
+  tg_user_id bigint primary key,
+  role       text not null check (role in ('admin', 'rop')),
+  name       text not null default '',
+  added_by   bigint,
+  created_at timestamptz not null default now()
+);
+
+-- Mijozlarning operator/menejerlar ustidan shikoyatlari (draft — mijoz hali matnni yozmagan)
+create table if not exists complaints (
+  id              bigint generated always as identity primary key,
+  client_id       bigint not null references clients(tg_user_id) on delete cascade,
+  staff_id        bigint not null references staff(id) on delete cascade,
+  conversation_id bigint references conversations(id) on delete set null,
+  text            text,
+  status          text not null default 'draft' check (status in ('draft', 'new', 'resolved')),
+  created_at      timestamptz not null default now(),
+  submitted_at    timestamptz,
+  resolved_at     timestamptz,
+  resolved_by     bigint
+);
+create index if not exists complaints_status_idx on complaints (status, submitted_at desc);
+create index if not exists complaints_client_draft_idx on complaints (client_id) where status = 'draft';
+
+-- Ommaviy xabarlar (ROP/developer → barcha mijozlar), bir nechta so'rov davomida bo'laklab yuboriladi
+create table if not exists broadcasts (
+  id               bigint generated always as identity primary key,
+  created_by       bigint not null,
+  content          jsonb not null,
+  status           text not null default 'pending' check (status in ('pending', 'running', 'done', 'cancelled')),
+  total            integer not null default 0,
+  sent             integer not null default 0,
+  failed           integer not null default 0,
+  blocked          integer not null default 0,
+  last_client_id   bigint not null default 0,
+  locked_until     timestamptz,
+  progress_chat_id bigint,
+  progress_msg_id  bigint,
+  created_at       timestamptz not null default now(),
+  started_at       timestamptz,
+  finished_at      timestamptz
+);
+
 -- Xavfsizlik: Supabase publishable/anon kaliti orqali jadvallarni o'qib bo'lmasin.
 -- Server "postgres" roli bilan ulanadi va RLS dan o'tadi.
 alter table staff             enable row level security;
@@ -190,14 +239,17 @@ alter table settings          enable row level security;
 alter table message_links     enable row level security;
 alter table rate_limits       enable row level security;
 alter table webapp_sends      enable row level security;
+alter table panel_roles       enable row level security;
+alter table complaints        enable row level security;
+alter table broadcasts        enable row level security;
 
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke all on staff, clients, conversations, messages, processed_updates, user_state, settings, message_links, rate_limits, webapp_sends from anon;
+    revoke all on staff, clients, conversations, messages, processed_updates, user_state, settings, message_links, rate_limits, webapp_sends, panel_roles, complaints, broadcasts from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    revoke all on staff, clients, conversations, messages, processed_updates, user_state, settings, message_links, rate_limits, webapp_sends from authenticated;
+    revoke all on staff, clients, conversations, messages, processed_updates, user_state, settings, message_links, rate_limits, webapp_sends, panel_roles, complaints, broadcasts from authenticated;
   end if;
 end $$;
 `;

@@ -1433,6 +1433,113 @@ html[data-scheme='dark'] .tabs-ind {
   padding: 0 10px;
 }
 
+/* Panel roli (🛠 Developer / 👑 ROP (rahbar) / ⚙️ Admin) */
+.role-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin: 4px 6px 0;
+}
+
+.role-line[hidden] {
+  display: none;
+}
+
+.role-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+
+.role-chip.role-rop {
+  background: rgba(217, 138, 4, 0.14);
+  color: var(--warn);
+}
+
+.role-chip.role-developer {
+  background: rgba(155, 89, 182, 0.14);
+  color: #8e44ad;
+}
+
+html[data-scheme='dark'] .role-chip.role-developer {
+  background: rgba(196, 140, 230, 0.18);
+  color: #d3a4f0;
+}
+
+.role-line-sub {
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--hint);
+}
+
+/* ROP/developer: yangi shikoyatlar kartasi */
+.complaints-wrap {
+  margin-top: 10px;
+}
+
+.complaints-wrap[hidden] {
+  display: none;
+}
+
+.stat-wide {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stat-wide.warn {
+  box-shadow: var(--card-shadow), inset 0 0 0 1px var(--warn);
+}
+
+.stat-wide-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.stat-wide-num {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-wide.warn .stat-wide-num {
+  color: var(--warn);
+}
+
+.stat-wide .stat-sub {
+  margin-top: 0;
+  flex: none;
+}
+
+.complaints-hint {
+  margin-top: 8px;
+}
+
+.complaints-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+/* Xodim formasi: bloklash / blokdan chiqarish */
+.block-row .btn {
+  flex: none;
+}
+
 /* ─────────────── Ichki ekranlar (formalar, sozlamalar) ─────────────── */
 
 .bar {

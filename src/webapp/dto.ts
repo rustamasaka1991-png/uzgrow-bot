@@ -369,8 +369,27 @@ export function clientConvSummary(row: ClientConvRow, activeId: number | null): 
   };
 }
 
+/**
+ * staffConvSummary o'qiydigan ustunlar. DIQQAT: Mini App ro'yxat imzosi (list_sig) bazada aynan shu ustunlardan
+ * hisoblanadi (queries.ts: staffListSigExpr). Bu funksiya yangi ustunga bog'liq bo'lib qolsa yoki natija boshqacha
+ * hisoblansa — imzoga ham qo'shing va STAFF_LIST_SIG_VERSION ni oshiring.
+ */
+export type StaffConvSummarySource = Pick<
+  ConversationView,
+  | 'id'
+  | 'staff_id'
+  | 'client_id'
+  | 'last_message_at'
+  | 'last_message_preview'
+  | 'last_sender'
+  | 'unread_staff'
+  | 'client_first_name'
+  | 'client_last_name'
+  | 'client_username'
+>;
+
 /** Xodim uchun: suhbatdosh — mijoz. */
-export function staffConvSummary(row: ConversationView, activeId: number | null): ConvSummaryDTO {
+export function staffConvSummary(row: StaffConvSummarySource, activeId: number | null): ConvSummaryDTO {
   const name = clientName({ first_name: row.client_first_name, last_name: row.client_last_name });
   return {
     id: row.id,
@@ -394,7 +413,28 @@ export function staffConvSummary(row: ConversationView, activeId: number | null)
 
 // ───────────────────────────── Xabarlar ─────────────────────────────
 
-export function messageDTO(m: Message, role: AppRole): MessageDTO {
+/** messageDTO o'qiydigan ustunlar (sync ularni ixcham so'rov bilan oladi — queries.ts: syncMessages). */
+export type MessageDTOSource = Pick<
+  Message,
+  | 'id'
+  | 'conversation_id'
+  | 'sender'
+  | 'kind'
+  | 'text'
+  | 'meta'
+  | 'file_id_client'
+  | 'file_id_staff'
+  | 'file_name'
+  | 'mime_type'
+  | 'file_size'
+  | 'client_chat_msg_id'
+  | 'staff_chat_msg_id'
+  | 'via'
+  | 'created_at'
+  | 'edited_at'
+>;
+
+export function messageDTO(m: MessageDTOSource, role: AppRole): MessageDTO {
   let media: MediaDTO | null = null;
   if (MEDIA_KINDS.has(m.kind)) {
     const hasFile = !!(m.file_id_client || m.file_id_staff);

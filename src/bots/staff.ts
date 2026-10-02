@@ -1,8 +1,8 @@
 // Operator va menejerlar boti (STAFF_BOT_TOKEN): mijozlar xabarlarini qabul qilish, javob berish,
-// chatlar ro'yxati va tarixi. Admin panel — ./admin.ts (shu botning ichida).
+// chatlar ro'yxati va tarixi. Boshqaruv paneli (developer / ROP / admin) — ./admin.ts va ./panel/* (shu botning ichida).
 import { Bot, Composer, InlineKeyboard, type BotError, type CommandContext, type NextFunction } from 'grammy';
 import type { Message as TgMessage } from 'grammy/types';
-import { config, isAdmin } from '../config.js';
+import { config } from '../config.js';
 import { db } from '../db.js';
 import { getWebAppUrl } from '../links.js';
 import {
@@ -24,6 +24,7 @@ import {
   updateStaff,
   updateStaffUsername,
 } from '../repo.js';
+import { ROLE_TITLES, can, getPanelRole, panelRecipients, type PanelRole } from '../roles.js';
 import { setAdminCommands } from '../setup.js';
 import { greetingText } from '../texts.js';
 import { extractContent, react, retryOnFlood } from '../tg.js';
@@ -51,7 +52,9 @@ import {
   ERROR_TEXT,
   INACTIVE_TEXT,
   NOT_STAFF_TEXT,
+  PANEL_CALLBACK_RE as PANEL_CALLBACK_DATA_RE,
   STALE_BUTTON_TEXT,
+  afterSuccess,
   callbackMessage,
   clientLinkOf,
   isCommandMessage,
@@ -169,7 +172,7 @@ async function ensureCallbackAnswered(ctx: StaffContext, next: NextFunction): Pr
   }
 }
 
-/** Kim yozyapti: ulangan xodim (ctx.staff) va/yoki admin (ctx.admin). */
+/** Kim yozyapti: ulangan xodim (ctx.staff) va/yoki panel roli (ctx.panelRole: developer / ROP / admin). */
 async function identity(ctx: StaffContext, next: NextFunction): Promise<void> {
   const from = ctx.from!;
   let staff = await getStaffByTgId(from.id);
@@ -193,7 +196,15 @@ async function identity(ctx: StaffContext, next: NextFunction): Promise<void> {
     }
   }
   ctx.staff = staff;
-  ctx.admin = isAdmin(from.id);
+  // Rol har bir update da qayta aniqlanadi (olib tashlangan huquq darhol amal qiladi). Panel tugmalari (bloklash,
+  // o'chirish, shikoyatlar, ommaviy xabar, developer) va panelga kirish xabarlari (/start, /admin, /cancel,
+  // «⚙️ Admin panel») — keshsiz: boshqa instansiyada olib tashlangan (yoki berilgan) rol ham darhol amal qiladi.
+  // Keshda rol bo'lsa — har qanday update da (kutilayotgan panel kiritmasi ham) rol bazadan qayta tekshiriladi.
+  const panelCallback = PANEL_CALLBACK_DATA_RE.test(ctx.callbackQuery?.data ?? '');
+  const text = ctx.message?.text ?? '';
+  const panelEntry = text === BTN.admin || /^\/(start|admin|cancel)(@\w+)?(\s|$)/i.test(text);
+  ctx.panelRole = await getPanelRole(from.id, { fresh: panelCallback || panelEntry, freshIfRole: true });
+  ctx.admin = !!ctx.panelRole;
   await next();
 }
 
@@ -211,13 +222,18 @@ async function unknownUserGuard(ctx: StaffContext, next: NextFunction): Promise<
 
 async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
   const payload = (ctx.match ?? '').trim();
+  // Tugallanmagan panel amali bekor qilinadi (so'rov xabaridagi tugmalar ham olib tashlanadi) — huquqi olib
+  // tashlangan foydalanuvchida qolib ketgan holat ham
+  await dropAdminState(ctx);
   if (ctx.admin) {
-    // Tugallanmagan admin amali bekor qilinadi (so'rov xabaridagi tugmalar ham olib tashlanadi)
-    await dropAdminState(ctx);
-    // /admin buyrug'i faqat adminlar menyusida ko'rinsin (setup vaqtida admin chati hali bo'lmagan bo'lishi mumkin)
+    // /admin buyrug'i faqat panel foydalanuvchilari menyusida ko'rinsin (setup vaqtida ularning chati hali bo'lmagan bo'lishi mumkin)
     await setAdminCommands(ctx.api, ctx.from!.id).catch((e) =>
       console.warn('[staff] admin buyruqlari o\'rnatilmadi:', tgErrorDescription(e)),
     );
+  } else {
+    // Panel roli yo'q: rol olib tashlanishi bilan bir vaqtda boshqa instansiyada qayta o'rnatilgan eski /admin
+    // buyrug'i menyuda qolib ketmasin (xatolar e'tiborsiz)
+    await ctx.api.deleteMyCommands({ scope: { type: 'chat', chat_id: ctx.from!.id } }).catch(() => {});
   }
 
   if (payload.startsWith('inv_')) {
@@ -227,26 +243,40 @@ async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
 
   const me = ctx.staff;
   if (me) {
-    await sendHtml(ctx, staffWelcomeText(me, ctx.admin, await clientLinkOf(me)), { markup: mainKeyboard(me, ctx.admin) });
+    await sendHtml(ctx, staffWelcomeText(me, ctx.panelRole, await clientLinkOf(me)), { markup: mainKeyboard(me, ctx.admin) });
     await sendWebAppHint(ctx);
     return;
   }
-  if (ctx.admin) {
-    await sendHtml(
-      ctx,
-      '👋 Assalomu alaykum! Siz <b>admin</b>siz.\n\n' +
-        '⚙️ «Admin panel» orqali operator va menejerlarni qo\'shing, ularga taklif havolasini yuboring, ' +
-        'matnlarni sozlang va statistikani kuzating.\n\n' +
-        'ℹ️ Mijozlar bilan o\'zingiz ham yozishmoqchi bo\'lsangiz — o\'zingizni xodim sifatida qo\'shib, ' +
-        'taklif havolasini bosing.',
-      { markup: mainKeyboard(null, true) },
-    );
+  if (ctx.panelRole) {
+    await sendHtml(ctx, panelWelcomeText(ctx.panelRole), { markup: mainKeyboard(null, true) });
     return;
   }
   await sendHtml(ctx, NOT_STAFF_TEXT, { markup: { remove_keyboard: true } });
 }
 
-function staffWelcomeText(me: Staff, admin: boolean, clientLink: string): string {
+/** Xodim profili yo'q panel foydalanuvchisi (developer / ROP / admin) uchun /start matni. */
+function panelWelcomeText(role: PanelRole): string {
+  const lines = [
+    `👋 Assalomu alaykum! Sizning rolingiz: <b>${ROLE_TITLES[role]}</b>.`,
+    '',
+    "⚙️ «Admin panel» orqali operator va menejerlarni qo'shing, ularga taklif havolasini yuboring, bloklang yoki " +
+      "o'chiring, matnlarni sozlang va statistikani kuzating.",
+  ];
+  if (can(role, 'broadcast')) {
+    lines.push('', '📣 Mijozlarga ommaviy xabar yuborish ham shu yerda.');
+  }
+  if (can(role, 'complaints')) {
+    lines.push('', '⚠️ Xodimlar ustidan shikoyatlarni ko‘rish ham shu yerda.');
+  }
+  if (can(role, 'developer')) lines.push('', "🛠 Developer panel — admin va ROP larni qo'shish, tizim holati.");
+  lines.push(
+    '',
+    "ℹ️ Mijozlar bilan o'zingiz ham yozishmoqchi bo'lsangiz — o'zingizni xodim sifatida qo'shib, taklif havolasini bosing.",
+  );
+  return lines.join('\n');
+}
+
+function staffWelcomeText(me: Staff, role: PanelRole | null, clientLink: string): string {
   const lines = [
     `👋 Assalomu alaykum, <b>${esc(me.full_name)}</b>!`,
     '',
@@ -254,7 +284,7 @@ function staffWelcomeText(me: Staff, admin: boolean, clientLink: string): string
     '',
   ];
   if (clientLink) {
-    const hint = me.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz faollashtirilgach ishlaydi.';
+    const hint = me.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz blokdan chiqarilgach ishlaydi.';
     lines.push(`🔗 Mijozlar uchun havolangiz: ${esc(clientLink)}`, `<i>${esc(hint)}</i>`, '');
   }
   lines.push(
@@ -264,10 +294,10 @@ function staffWelcomeText(me: Staff, admin: boolean, clientLink: string): string
   if (!me.is_active) {
     lines.push(
       '',
-      "⛔ Profilingiz hozircha o'chirib qo'yilgan — mijozlar sizni ro'yxatda ko'rmaydi va siz ham ularga xabar yubora olmaysiz.",
+      "🚫 Profilingiz bloklangan — mijozlar sizni ro'yxatda ko'rmaydi va siz ham ularga xabar yubora olmaysiz.",
     );
   }
-  if (admin) lines.push('', '⚙️ Siz adminsiz — «Admin panel» tugmasi orqali xodimlarni boshqarasiz.');
+  if (role) lines.push('', `⚙️ Sizning rolingiz: <b>${ROLE_TITLES[role]}</b> — «${BTN.admin}» tugmasi orqali boshqarasiz.`);
   return lines.join('\n');
 }
 
@@ -315,7 +345,7 @@ async function handleInvite(ctx: StaffContext, code: string): Promise<void> {
     lines.push(
       '🔗 <b>Mijozlar uchun havolangiz:</b>',
       esc(clientLink),
-      esc(s.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz faollashtirilgach ishlaydi.'),
+      esc(s.is_active ? CLIENT_LINK_HINT : 'Havola profilingiz blokdan chiqarilgach ishlaydi.'),
       `<i>📋 Nusxalash va ulashish — «${BTN.profile}» da.</i>`,
       '',
     );
@@ -330,18 +360,20 @@ async function handleInvite(ctx: StaffContext, code: string): Promise<void> {
   if (!s.is_active) {
     lines.push(
       '',
-      "⛔ Profilingiz hozircha o'chirib qo'yilgan — admin faollashtirgach, mijozlar sizni ko'radi va siz ularga yoza olasiz.",
+      "🚫 Profilingiz hozircha bloklangan — blokdan chiqarilgach, mijozlar sizni ko'radi va siz ularga yoza olasiz.",
     );
   }
-  await sendHtml(ctx, lines.join('\n'), { markup: mainKeyboard(s, ctx.admin) });
-  await sendWebAppHint(ctx);
+  // Akkaunt allaqachon ulangan — xush kelibsiz xabari eng yaxshi urinish (adminlarga xabar baribir yuboriladi)
+  await afterSuccess('ulanish tasdig\'i', async () => {
+    await sendHtml(ctx, lines.join('\n'), { markup: mainKeyboard(s, ctx.admin) });
+    await sendWebAppHint(ctx);
+  });
 
   const who = from.username ? `@${esc(from.username)}` : `ID: <code>${from.id}</code>`;
   const note = `🔗 <b>${esc(s.full_name)}</b> (${roleLabel(s.role)}) akkauntini ulab oldi (${who})`;
+  const recipients = await panelRecipients('panel').catch(() => config.adminIds);
   await Promise.allSettled(
-    config.adminIds
-      .filter((id) => id !== from.id)
-      .map((id) => ctx.api.sendMessage(id, note, { parse_mode: 'HTML' })),
+    recipients.filter((id) => id !== from.id).map((id) => ctx.api.sendMessage(id, note, { parse_mode: 'HTML' })),
   );
 }
 
@@ -642,7 +674,8 @@ async function toggleStatus(ctx: StaffContext): Promise<void> {
   const text = updated.is_online
     ? '🟢 Siz endi <b>onlayn</b>siz — mijozlar buni ko\'radi.'
     : '⚪️ Siz endi <b>oflayn</b>siz — avto-javobga «hozir ish joyida emas» qo\'shiladi.';
-  await sendHtml(ctx, text, { markup: mainKeyboard(updated, ctx.admin) });
+  // Holat allaqachon almashgan: «qayta urinib ko'ring» bo'yicha qayta bosish uni ortga qaytarib yuborardi
+  await afterSuccess('holat tasdig\'i', () => sendHtml(ctx, text, { markup: mainKeyboard(updated, ctx.admin) }));
 }
 
 // ── 👤 Profilim ──
@@ -671,7 +704,7 @@ async function showProfile(ctx: StaffContext): Promise<void> {
       me.is_online ? '🟢 Holat: <b>onlayn</b>' : '⚪️ Holat: <b>oflayn</b>',
       me.is_active
         ? '✅ Profil faol — mijozlar sizni menyuda ko\'radi'
-        : "⛔ Profil o'chirib qo'yilgan — mijozlar sizni ko'rmaydi, siz ham ularga yoza olmaysiz",
+        : "🚫 Profil bloklangan — mijozlar sizni ko'rmaydi, siz ham ularga yoza olmaysiz",
       `💬 Chatlar: <b>${stats.chats}</b>${stats.unread ? ` (o'qilmagan: ${stats.unread})` : ''}`,
     );
     if (clientLink) {
@@ -680,7 +713,7 @@ async function showProfile(ctx: StaffContext): Promise<void> {
         `🔗 Mijozlar uchun havolangiz: ${esc(clientLink)}`,
         me.is_active
           ? "Mijoz shu havola orqali kirsa, darhol siz bilan chat boshlanadi."
-          : "Profilingiz faollashtirilgach ishlaydi.",
+          : 'Profilingiz blokdan chiqarilgach ishlaydi.',
       );
     }
     lines.push(
@@ -740,27 +773,55 @@ async function showHelp(ctx: StaffContext): Promise<void> {
         ? '📱 <b>Mini App</b> — pastdagi «💬 Chatlar» menyu tugmasi orqali barcha suhbatlarni Telegramdagidek qulay ko\'rinishda ochasiz.'
         : '📱 <b>Mini App</b> — menyu tugmasi orqali barcha suhbatlarni qulay ko\'rinishda ochish mumkin.',
       '',
-      '🔒 Suhbatlaringizni faqat siz ko\'rasiz — boshqa xodimlar va adminlar ularni ko\'ra olmaydi.',
+      '🔒 Suhbatlaringizni faqat siz ko\'rasiz — boshqa xodimlar va adminlar ularni ko\'ra olmaydi. Mijoz siz ustingizdan shikoyat qilsa, rahbar (ROP) o\'sha suhbatni ko\'rib chiqishi mumkin.',
       '',
       'Buyruqlar: /chats, /status, /profile, /cancel, /help',
     );
   } else {
+    const role = ctx.panelRole;
     parts.push(
-      'ℹ️ <b>Admin uchun qisqa yo\'riqnoma</b>',
+      `ℹ️ <b>Qisqa yo'riqnoma</b> · ${role ? ROLE_TITLES[role] : ROLE_TITLES.admin}`,
       '',
       `1. «${BTN.admin}» → «➕ Xodim qo'shish»: rol, ism, lavozim, tavsif, avto-javob va rasmni kiriting.`,
       '2. Xodim kartasidagi taklif havolasini o\'sha xodimga yuboring — u havolani bosib, Telegram akkauntini ulaydi.',
       '3. Ulangan va faol xodimlarni mijozlar menyuda ko\'radi va ular bilan yozishadi.',
+      "4. Xodim kartasida «🚫 Bloklash» — mijozlar uni ko'rmaydi va u mijozlarga yoza olmaydi; «🗑 O'chirish» — ro'yxatdan butunlay olib tashlash.",
       '',
       '🔗 Har bir xodimning <b>mijozlar uchun shaxsiy havolasi</b> bor (kartada): mijoz shu havola orqali kirsa, hech narsa tanlamasdan darhol o\'sha xodim bilan chat boshlanadi. Nomini «✏️ Havola nomi» tugmasi bilan o\'zgartirasiz.',
+    );
+    if (can(role, 'broadcast')) {
+      parts.push(
+        '',
+        "📣 «Mijozlarga xabar» — barcha mijozlarga bot orqali xabar (matn, rasm, video, fayl...). Yuborishdan oldin ko'rinishi ko'rsatiladi.",
+      );
+    }
+    if (can(role, 'complaints')) {
+      parts.push(
+        '',
+        "⚠️ «Shikoyatlar» — mijozlarning xodimlar ustidan shikoyatlari: shikoyat qilingan suhbatni o'qish va «hal qilindi» deb belgilash.",
+      );
+    }
+    if (can(role, 'developer')) {
+      parts.push('', "🛠 «Developer panel» — admin va ROP larni Telegram ID orqali qo'shish/olib tashlash, tizim holati.");
+    }
+    parts.push(
       '',
-      '🔒 Mijoz va xodim o\'rtasidagi yozishmalar maxfiy — ularni faqat o\'sha xodim ko\'radi.',
+      can(role, 'complaints')
+        ? "🔒 Mijoz va xodim o'rtasidagi yozishmalar maxfiy — ularni faqat o'sha xodim ko'radi (ROP — faqat shikoyat qilingan suhbatni)."
+        : "🔒 Mijoz va xodim o'rtasidagi yozishmalar maxfiy — ularni faqat o'sha xodim ko'radi.",
       '',
       'Buyruqlar: /admin, /cancel, /help',
     );
   }
-  if (ctx.staff && ctx.admin) {
-    parts.push('', `⚙️ <b>Admin</b>: «${BTN.admin}» — xodimlarni qo'shish/tahrirlash, taklif va mijoz havolalari, matnlar va statistika.`);
+  if (ctx.staff && ctx.panelRole) {
+    const extras: string[] = [];
+    if (can(ctx.panelRole, 'broadcast')) extras.push('mijozlarga xabar');
+    if (can(ctx.panelRole, 'complaints')) extras.push('shikoyatlar');
+    const extra = extras.length ? `, ${extras.join(' va ')}` : '';
+    parts.push(
+      '',
+      `⚙️ <b>${ROLE_TITLES[ctx.panelRole]}</b>: «${BTN.admin}» — xodimlarni qo'shish/tahrirlash/bloklash, taklif va mijoz havolalari, matnlar, statistika${extra}.`,
+    );
   }
   await sendHtml(ctx, parts.join('\n'), { markup: mainKeyboard(ctx.staff, ctx.admin) });
 }
@@ -848,17 +909,21 @@ async function routeStaffMessage(ctx: StaffContext): Promise<void> {
     // Mijozda ham javob sifatida (iqtibos bilan) ko'rinsin — Telegramdagidek
     ...(replyTo ? { replyToStaffMsgId: replyTo.message_id } : {}),
   });
+  // react() o'zi eng yaxshi urinish (xatolarni yutadi)
   if (res.ok) await react('staff', chatId, msg.message_id, '👍');
   else await sendHtml(ctx, esc(relayFailureText(res)), { replyTo: msg.message_id, markup: retryMarkup(res) });
 
-  // Reply aktiv suhbatni boshqa mijozga almashtirdi — xodim buni aniq ko'rsin
+  // Reply aktiv suhbatni boshqa mijozga almashtirdi — xodim buni aniq ko'rsin. Eng yaxshi urinish: xabar mijozga
+  // allaqachon yetkazilgan bo'lishi mumkin — bu izoh yuborilmasa (429/5xx/timeout), xodimga «⚠️ Xatolik… qayta
+  // urinib ko'ring» ko'rsatilmaydi (aks holda u javobni qayta yuboradi va mijoz uni ikki marta oladi).
   if (previousActive != null) {
-    const v = await ownConversationView(me, conversation.id);
-    if (v) {
+    await afterSuccess("«🔁 Endi Reply'siz…» izohi", async () => {
+      const v = await ownConversationView(me, conversation.id);
+      if (!v) return;
       await sendHtml(ctx, `🔁 Endi Reply'siz xabarlaringiz <b>${esc(clientNameOf(v))}</b>${dativeSuffix(clientNameOf(v))} yuboriladi.`, {
         markup: deactButton(new InlineKeyboard(), v.id),
       });
-    }
+    });
   }
 }
 
@@ -1052,7 +1117,11 @@ async function onRetry(ctx: StaffContext, idStr: string | undefined): Promise<vo
   }
 }
 
-/** So'rov xabarini yakuniy natija bilan almashtirish; tahrirlab bo'lmasa — yangi xabar. */
+/**
+ * So'rov xabarini yakuniy natija bilan almashtirish; tahrirlab bo'lmasa — yangi xabar. Eng yaxshi urinish: natija
+ * (✅ yuborildi / xato matni) callback javobida allaqachon ko'rsatilgan, xabar esa mijozga yetkazilgan bo'lishi
+ * mumkin — bu yerdagi xato «⚠️ Xatolik… qayta urinib ko'ring» ga aylanmasligi kerak.
+ */
 async function editPrompt(ctx: StaffContext, html: string, replyTo: number, markup?: InlineKeyboard): Promise<void> {
   try {
     await ctx.editMessageText(html, {
@@ -1063,6 +1132,6 @@ async function editPrompt(ctx: StaffContext, html: string, replyTo: number, mark
   } catch (e) {
     if (isNotModified(e)) return;
     console.warn('[staff] so\'rovni tahrirlab bo\'lmadi:', tgErrorDescription(e));
-    await sendHtml(ctx, html, { replyTo, ...(markup ? { markup } : {}) });
+    await afterSuccess("«Bu xabar kimga?» natijasi", () => sendHtml(ctx, html, { replyTo, ...(markup ? { markup } : {}) }));
   }
 }

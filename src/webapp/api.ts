@@ -1,14 +1,17 @@
 // Mini App backend: POST /api/app
 // So'rov: JSON { initData, action, ...params } yoki multipart/form-data (fayl yuklash uchun: initData, action, ..., file).
 // Javob: { ok: true, ...data } yoki { ok: false, error: <kod>, message: <o'zbekcha matn> }.
-// Mini App faqat xodimlar (va admin) uchun: mijozlar boti orqali ochilgan initData bilan har qanday amal
-// 403 client_app_disabled qaytaradi (mijozlar faqat bot chatida yozadi). Mijoz tomonidagi eski kod yo'llari
-// (ClientCtx) endi ishlatilmaydi, lekin umumiy funksiyalar bilan chambarchas bog'liq bo'lgani uchun qoldirilgan.
+// Mini App faqat xodimlar va panel rollari (developer / ROP / admin — src/roles.ts) uchun: mijozlar boti orqali
+// ochilgan initData bilan har qanday amal 403 client_app_disabled qaytaradi (mijozlar faqat bot chatida yozadi).
+// Panel roli har so'rovda qayta aniqlanadi (getPanelRole) — olib tashlangan rol darhol kuchini yo'qotadi.
+// Mijoz tomonidagi eski kod yo'llari (ClientCtx) endi ishlatilmaydi, lekin umumiy funksiyalar bilan chambarchas
+// bog'liq bo'lgani uchun qoldirilgan.
 import { createHash } from 'node:crypto';
 import { InputFile } from 'grammy';
 import { verifyInitData, type WebAppAuth, type WebAppUser } from '../auth.js';
-import { isAdmin } from '../config.js';
+import { countComplaints } from '../complaints.js';
 import { json } from '../http.js';
+import { ROLE_TITLES, can, getPanelRole, type PanelRole } from '../roles.js';
 import {
   contentFromMessage,
   relayClientMessage,
@@ -21,7 +24,6 @@ import {
 } from '../relay.js';
 import {
   addMessageLinks,
-  countStaffConversations,
   createStaff,
   deleteSetting,
   getClient,
@@ -39,7 +41,6 @@ import {
   listAllStaff,
   listAvailableStaff,
   listMessages,
-  listStaffConversations,
   markReadByClient,
   normalizeLinkCode,
   markReadByStaff,
@@ -61,7 +62,7 @@ import { FileTooBigError, apiFor, clientApi, sendContent, staffApi } from '../tg
 import type { BotKind, Client, Content, Conversation, Message, Sender, Staff } from '../types.js';
 import { clientName, dativeSuffix, describeError, esc, oneLine, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
 import { deliverHeldToConversation } from '../bots/client/routing.js';
-import { mainKeyboard } from '../bots/staff/ui.js';
+import { BLOCK_NOTICE, mainKeyboard } from '../bots/staff/ui.js';
 import { ensureSchema } from '../setup.js';
 import {
   MEDIA_KINDS,
@@ -76,16 +77,22 @@ import {
   staffProfileDTO,
   type ConvSummaryDTO,
   type MessageDTO,
+  type MessageDTOSource,
 } from './dto.js';
 import { MAX_UPLOAD_BYTES, classifyUpload, extForMime, redact, sniffImage } from './files.js';
 import { claimSend, completeSend, hitRateLimit, releaseSend, type RateRule } from './guards.js';
 import {
   activeRouteStaff,
-  deliveredAmong,
+  getConversationRef,
+  getStaffRefByTgId,
   listClientConvRows,
-  listEditedMessages,
   searchStaffConvRows,
+  staffListRows,
+  staffListState,
   sumStaffUnread,
+  syncMessages,
+  type ConversationRef,
+  type StaffRef,
 } from './queries.js';
 
 // ───────────────────────────── Umumiy ─────────────────────────────
@@ -404,12 +411,26 @@ interface StaffCtx {
   role: 'staff';
   user: WebAppUser;
   me: Staff | null;
+  /** Xodimlar botidagi panel roli (developer / rop / admin) yoki null */
+  panelRole: PanelRole | null;
+  /** Admin paneli amallariga ruxsat (istalgan panel roli) — can(panelRole, 'panel') */
   admin: boolean;
   params: Params;
   file: File | null;
 }
 
 type Ctx = ClientCtx | StaffCtx;
+
+/**
+ * sync uchun yengil kontekst (Mini App uni har 3–8 soniyada chaqiradi): xodim yozuvidan faqat id va aktiv suhbat
+ * o'qiladi — to'liq profil (tavsif, salomlashuv, rasm, taklif kodi...) har so'rovda bazadan qayta yuklanmaydi.
+ * Ruxsat tekshiruvi buildContext bilan aynan bir xil. Ctx ham SyncCtx ga mos keladi.
+ */
+interface StaffRefCtx extends Omit<StaffCtx, 'me'> {
+  me: StaffRef | null;
+}
+
+type SyncCtx = ClientCtx | StaffRefCtx;
 
 /**
  * initData ni tekshirish. Mijozlar boti orqali ochilgan Mini App — 403 client_app_disabled: mijozlar uchun
@@ -423,13 +444,32 @@ function authenticate(parsed: ParsedRequest): WebAppAuth {
   return auth;
 }
 
-/** Xodim/admin konteksti (faqat xodimlar boti initData si bilan — authenticate() dan keyin). */
+/**
+ * Xodim/panel konteksti (faqat xodimlar boti initData si bilan — authenticate() dan keyin). Panel roli har so'rovda
+ * aniqlanadi: developer — ADMIN_IDS env, admin/ROP — panel_roles jadvali. Na xodim, na panel roli — 403 not_staff.
+ */
 async function buildContext(auth: WebAppAuth, parsed: ParsedRequest): Promise<Ctx> {
+  return resolveStaffContext(auth, parsed, getStaffByTgId);
+}
+
+/** sync uchun: xodim yozuvidan faqat id va aktiv suhbat (getStaffByTgId bilan bir xil shart). */
+async function buildSyncContext(auth: WebAppAuth, parsed: ParsedRequest): Promise<SyncCtx> {
+  return resolveStaffContext(auth, parsed, getStaffRefByTgId);
+}
+
+async function resolveStaffContext<T>(
+  auth: WebAppAuth,
+  parsed: ParsedRequest,
+  loadStaff: (tgUserId: number) => Promise<T | null>,
+): Promise<{ role: 'staff'; user: WebAppUser; me: T | null; panelRole: PanelRole | null; admin: boolean; params: Params; file: File | null }> {
   const { user } = auth;
-  const me = await getStaffByTgId(user.id);
-  const admin = isAdmin(user.id);
+  // Admin amallari (xodimni bloklash/o'chirish, matnlar...) — rol keshsiz tekshiriladi: boshqa instansiyada olib
+  // tashlangan rol ham darhol kuchini yo'qotadi
+  const fresh = parsed.action.startsWith('admin.');
+  const [me, panelRole] = await Promise.all([loadStaff(user.id), getPanelRole(user.id, { fresh })]);
+  const admin = can(panelRole, 'panel');
   if (!me && !admin) throw new ApiError(403, 'not_staff', MSG.notStaff);
-  return { role: 'staff', user, me, admin, params: parsed.params, file: parsed.file };
+  return { role: 'staff', user, me, panelRole: admin ? panelRole : null, admin, params: parsed.params, file: parsed.file };
 }
 
 function requireClient(ctx: Ctx): ClientCtx {
@@ -442,14 +482,14 @@ function requireStaffMe(ctx: Ctx): StaffCtx & { me: Staff } {
   return ctx as StaffCtx & { me: Staff };
 }
 
+/** Admin paneli amallari: istalgan panel roli (developer / ROP / admin). */
 function requireAdmin(ctx: Ctx): StaffCtx {
-  if (ctx.role !== 'staff' || !ctx.admin) throw new ApiError(403, 'admin_only', MSG.adminOnly);
+  if (ctx.role !== 'staff' || !ctx.admin || !can(ctx.panelRole, 'panel')) throw new ApiError(403, 'admin_only', MSG.adminOnly);
   return ctx;
 }
 
-/** Suhbatni yuklash va egalikni tekshirish (maxfiylik: faqat o'z suhbatlari). */
-async function ownConversation(ctx: Ctx, id: number): Promise<Conversation> {
-  const conv = await getConversation(id);
+/** Egalikni tekshirish (maxfiylik: faqat o'z suhbatlari): yo'q — 404, boshqaniki — 403. */
+function assertOwnConversation<T extends Pick<Conversation, 'client_id' | 'staff_id'>>(ctx: SyncCtx, conv: T | null): T {
   if (!conv) throw new ApiError(404, 'not_found', MSG.convNotFound);
   const owns =
     ctx.role === 'client' ? conv.client_id === ctx.client.tg_user_id : !!ctx.me && conv.staff_id === ctx.me.id;
@@ -457,33 +497,38 @@ async function ownConversation(ctx: Ctx, id: number): Promise<Conversation> {
   return conv;
 }
 
-function activeId(ctx: Ctx): number | null {
+/** Suhbatni yuklash va egalikni tekshirish (maxfiylik: faqat o'z suhbatlari). */
+async function ownConversation(ctx: Ctx, id: number): Promise<Conversation> {
+  return assertOwnConversation(ctx, await getConversation(id));
+}
+
+/** ownConversation bilan bir xil tekshiruv, faqat kerakli ustunlar bilan (sync — har ~3 soniyada). */
+async function ownConversationRef(ctx: SyncCtx, id: number): Promise<ConversationRef> {
+  return assertOwnConversation(ctx, await getConversationRef(id));
+}
+
+function activeId(ctx: SyncCtx): number | null {
   return ctx.role === 'client' ? ctx.client.active_conversation_id : ctx.me?.active_conversation_id ?? null;
 }
 
-async function markRead(ctx: Ctx, conversationId: number): Promise<void> {
+async function markRead(ctx: Pick<SyncCtx, 'role'>, conversationId: number): Promise<void> {
   if (ctx.role === 'client') await markReadByClient(conversationId);
   else await markReadByStaff(conversationId);
 }
 
-function unreadFor(ctx: Ctx, conv: Conversation): number {
+function unreadFor(ctx: Pick<SyncCtx, 'role'>, conv: Pick<Conversation, 'unread_client' | 'unread_staff'>): number {
   return ctx.role === 'client' ? conv.unread_client : conv.unread_staff;
 }
 
-function toDTOs(ctx: Ctx, messages: Message[]): MessageDTO[] {
+function toDTOs(ctx: Pick<SyncCtx, 'role'>, messages: readonly MessageDTOSource[]): MessageDTO[] {
   return messages.map((m) => messageDTO(m, ctx.role));
 }
 
-/** Suhbatlar ro'yxati (mijoz: xabari bor yoki aktiv suhbatlar; xodim: faqat o'zinikilar, 100 tagacha). */
-async function listConversations(ctx: Ctx): Promise<ConvSummaryDTO[]> {
-  if (ctx.role === 'client') {
-    const active = ctx.client.active_conversation_id;
-    const rows = await listClientConvRows(ctx.client.tg_user_id);
-    return rows.filter((r) => r.last_message_at || r.id === active).map((r) => clientConvSummary(r, active));
-  }
-  if (!ctx.me) return [];
-  const rows = await listStaffConversations(ctx.me.id, { limit: STAFF_LIST_LIMIT });
-  return rows.map((r) => staffConvSummary(r, ctx.me!.active_conversation_id));
+/** Mijoz: suhbatlar ro'yxati (xabari bor yoki aktiv suhbatlar). */
+async function clientConversations(ctx: ClientCtx): Promise<ConvSummaryDTO[]> {
+  const active = ctx.client.active_conversation_id;
+  const rows = await listClientConvRows(ctx.client.tg_user_id);
+  return rows.filter((r) => r.last_message_at || r.id === active).map((r) => clientConvSummary(r, active));
 }
 
 /** Oxirgi (yoki beforeId dan oldingi) xabarlar sahifasi. */
@@ -648,10 +693,14 @@ async function conversationOpen(ctx: Ctx): Promise<Data> {
 // ───────────────────────────── Xodim amallari ─────────────────────────────
 
 async function staffBootstrap(ctx: StaffCtx): Promise<Data> {
-  const { me, admin, user } = ctx;
+  const { me, admin, panelRole, user } = ctx;
   const base = {
     role: 'staff',
+    // Admin paneli (istalgan panel roli) — eski mijoz kodi bilan moslik uchun
     is_admin: admin,
+    // Panel roli: 'developer' | 'rop' | 'admin' | null va uning sarlavhasi (masalan "👑 ROP (rahbar)")
+    panel_role: panelRole,
+    panel_role_title: panelRole ? ROLE_TITLES[panelRole] : null,
     user: { id: user.id, first_name: user.first_name ?? '', username: user.username ?? null },
     // Mijozlar boti username i: shaxsiy havolalar prefiksi (t.me/<client_bot>?start=...), '' — aniqlanmagan
     client_bot: await safeClientBotUsername(),
@@ -659,26 +708,32 @@ async function staffBootstrap(ctx: StaffCtx): Promise<Data> {
   if (!me) return { ...base, me: null, conversations: [], total: 0, has_more: false, active_conversation_id: null };
 
   const username = user.username ?? null;
-  const [rows, total, totalUnread] = await Promise.all([
-    listStaffConversations(me.id, { limit: STAFF_LIST_LIMIT }),
-    countStaffConversations(me.id),
-    sumStaffUnread(me.id),
+  const active = me.active_conversation_id;
+  // Mini App davriy bootstrap da oldingi `list_sig` ni yuboradi (ixtiyoriy): ro'yxat o'zgarmagan bo'lsa
+  // `conversations: null` (sync bilan bir xil). Imzosiz (birinchi ochilish) — ro'yxat doim to'liq.
+  const knownSig = listSigParam(ctx.params.listSig);
+  // Imzo, jami suhbatlar soni va o'qilmaganlar yig'indisi — bitta so'rovda; qatorlar faqat kerak bo'lsa
+  const [state, rowsFirst] = await Promise.all([
+    staffListState(me.id, active, STAFF_LIST_LIMIT, true),
+    knownSig ? Promise.resolve(null) : staffListRows(me.id, active, STAFF_LIST_LIMIT),
     username !== me.tg_username
       ? updateStaffUsername(me.id, username).catch((e) => console.error('updateStaffUsername:', e))
       : Promise.resolve(),
   ]);
-  const conversations = rows.map((r) => staffConvSummary(r, me.active_conversation_id));
+  const list = rowsFirst ?? (state.sig === knownSig ? null : await staffListRows(me.id, active, STAFF_LIST_LIMIT));
+  const conversations = list ? list.rows.map((r) => staffConvSummary(r, active)) : null;
+  const listed = conversations ? conversations.length : state.listed;
   return {
     ...base,
-    me: await staffProfileDTO({ ...me, tg_username: username }, totalUnread),
+    me: await staffProfileDTO({ ...me, tg_username: username }, state.unread),
     conversations,
-    list_sig: listSignature(conversations),
-    total,
+    list_sig: list ? list.sig : state.sig,
+    total: state.total,
     // Ro'yxat oxirgi STAFF_LIST_LIMIT ta suhbat bilan cheklangan; qolganlari 'conversations' amali orqali
     // (offset: next_offset) yoki server qidiruvi bilan yuklanadi
-    has_more: total > conversations.length,
-    next_offset: conversations.length,
-    active_conversation_id: me.active_conversation_id,
+    has_more: state.total > listed,
+    next_offset: listed,
+    active_conversation_id: active,
   };
 }
 
@@ -762,13 +817,43 @@ function idListParam(v: unknown): number[] {
 /** Mini App yuborgan ro'yxat imzosi (`listSig`): list_sig bilan bir xil format. Noto'g'ri qiymat — e'tiborsiz. */
 const LIST_SIG_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
+function listSigParam(v: unknown): string | null {
+  return typeof v === 'string' && LIST_SIG_RE.test(v) ? v : null;
+}
+
 /**
- * Suhbatlar ro'yxatining imzosi: javobdagi DTO larning to'liq JSON ko'rinishidan (ko'rinish, o'qilmaganlar, aktivlik,
- * suhbatdosh ismi/holati/rasmi — hammasi hisobga olinadi). DTO lar bir xil funksiyalar bilan bir xil tartibda
- * yasaladi, shuning uchun o'zgarmagan ro'yxat har doim bir xil imzo beradi.
+ * DTO lardan hisoblanadigan imzo — faqat mijoz (eski yo'l) va xodim profili yo'q panel foydalanuvchisi (bo'sh
+ * ro'yxat) uchun. Xodim ro'yxatining imzosi bazada hisoblanadi (queries.ts: staffListState / staffListRows).
  */
 function listSignature(conversations: readonly ConvSummaryDTO[]): string {
   return createHash('sha1').update(JSON.stringify(conversations)).digest('base64url');
+}
+
+interface ListPart {
+  conversations: ConvSummaryDTO[] | null;
+  list_sig: string;
+}
+
+/**
+ * Xodim ro'yxati imzo bilan: Mini App dagi imzo (`knownSig`) bazadagi holatga mos bo'lsa — faqat 32 baytli imzo
+ * o'qiladi va `conversations: null` qaytadi; aks holda (yoki imzo yo'q) qatorlar o'qiladi (imzo bilan birga, bitta
+ * so'rovda). Avval har so'rovda ~100 qatorlik join (~30 KB) o'qilib, faqat imzo uchun xeshlanardi.
+ */
+async function staffListPart(me: StaffRef, knownSig: string | null): Promise<ListPart> {
+  const active = me.active_conversation_id;
+  if (knownSig) {
+    const state = await staffListState(me.id, active, STAFF_LIST_LIMIT);
+    if (state.sig === knownSig) return { conversations: null, list_sig: state.sig };
+  }
+  const { rows, sig } = await staffListRows(me.id, active, STAFF_LIST_LIMIT);
+  return { conversations: rows.map((r) => staffConvSummary(r, active)), list_sig: sig };
+}
+
+async function syncListPart(ctx: SyncCtx, knownSig: string | null): Promise<ListPart> {
+  if (ctx.role === 'staff' && ctx.me) return staffListPart(ctx.me, knownSig);
+  const conversations = ctx.role === 'client' ? await clientConversations(ctx) : [];
+  const sig = listSignature(conversations);
+  return { conversations: sig === knownSig ? null : conversations, list_sig: sig };
 }
 
 /**
@@ -783,49 +868,40 @@ function listSignature(conversations: readonly ConvSummaryDTO[]): string {
  *  - `undelivered: [id...]` berilsa — ulardan endi yetkazilganlari (`updated`, delivered: true).
  * `server_time` — keyingi so'rovdagi `editedSince` uchun.
  */
-async function syncAction(ctx: Ctx): Promise<Data> {
+async function syncAction(ctx: SyncCtx): Promise<Data> {
   const conversationId = optId(ctx.params.conversationId);
   const afterId = optNonNegInt(ctx.params.afterId);
   const wantList = asBool(ctx.params.list) !== false;
-  const knownSig = typeof ctx.params.listSig === 'string' && LIST_SIG_RE.test(ctx.params.listSig) ? ctx.params.listSig : null;
+  const knownSig = listSigParam(ctx.params.listSig);
   const serverTime = new Date().toISOString();
-  const [conversations, conv] = await Promise.all([
-    wantList ? listConversations(ctx) : Promise.resolve(null),
-    conversationId !== undefined ? ownConversation(ctx, conversationId) : Promise.resolve(null),
-  ]);
 
   let messages: MessageDTO[] = [];
   let updated: MessageDTO[] = [];
-  if (conv) {
-    const since = editedSinceParam(ctx.params.editedSince);
-    const checkIds = idListParam(ctx.params.undelivered);
-    // afterId berilmasa — oxirgi sahifa; aks holda faqat yangi xabarlar
-    const [rows, edited, nowDelivered] = await Promise.all([
-      afterId === undefined
-        ? loadPage(conv.id, undefined, PAGE_DEFAULT).then((p) => p.messages)
-        : listMessages(conv.id, { afterId, limit: SYNC_MAX }),
-      since ? listEditedMessages(conv.id, since) : Promise.resolve([] as Message[]),
-      deliveredAmong(conv.id, checkIds),
-    ]);
+  if (conversationId !== undefined) {
+    const conv = await ownConversationRef(ctx, conversationId);
+    // afterId berilmasa — oxirgi sahifa; aks holda faqat yangi xabarlar. Tahrirlar va yetkazilganlar — o'sha so'rovda.
+    const found = await syncMessages(conv.id, {
+      afterId,
+      latest: PAGE_DEFAULT,
+      newLimit: SYNC_MAX,
+      editedSince: editedSinceParam(ctx.params.editedSince),
+      checkIds: idListParam(ctx.params.undelivered),
+    });
+    const rows = found.fresh;
     // Faqat suhbatdoshdan yangi xabar kelgan yoki o'qilmagan bo'lsa yozamiz (so'rov har ~3 soniyada keladi)
     const peer = ctx.role === 'client' ? 'staff' : 'client';
-    if (unreadFor(ctx, conv) > 0 || rows.some((m) => m.sender === peer)) {
-      await markRead(ctx, conv.id);
-      // Imzo shu o'zgarishdan KEYIN hisoblanadi — Mini App dagi ro'yxat bilan mos bo'lsin
-      if (conversations) for (const c of conversations) if (c.id === conv.id) c.unread = 0;
-    }
+    if (unreadFor(ctx, conv) > 0 || rows.some((m) => m.sender === peer)) await markRead(ctx, conv.id);
     messages = toDTOs(ctx, rows);
     const fresh = new Set(rows.map((m) => m.id));
-    const byId = new Map<number, Message>();
-    for (const m of [...edited, ...nowDelivered]) if (!fresh.has(m.id)) byId.set(m.id, m);
+    const byId = new Map<number, MessageDTOSource>();
+    for (const m of [...found.edited, ...found.delivered]) if (!fresh.has(m.id)) byId.set(m.id, m);
     updated = toDTOs(ctx, [...byId.values()]);
   }
 
-  let list: { conversations: ConvSummaryDTO[] | null; list_sig?: string } = { conversations: null };
-  if (conversations) {
-    const sig = listSignature(conversations);
-    list = { conversations: sig === knownSig ? null : conversations, list_sig: sig };
-  }
+  // Ro'yxat (va imzosi) ochiq chat o'qilgan deb belgilangandan KEYIN o'qiladi — Mini App dagi ro'yxat bilan mos bo'lsin
+  const list: { conversations: ConvSummaryDTO[] | null; list_sig?: string } = wantList
+    ? await syncListPart(ctx, knownSig)
+    : { conversations: null };
   return { ...list, messages, updated, active_conversation_id: activeId(ctx), server_time: serverTime };
 }
 
@@ -1174,16 +1250,17 @@ function validateStaffFields(src: Record<string, unknown>, creating: boolean): S
 
 /**
  * Xodimni xodimlar boti orqali xabardor qilish (bot admin paneli bilan bir xil). `resetKeyboard` — u endi xodim
- * emas: eski "💬 Chatlar / 🔄 Holat" klaviaturasi olib tashlanadi (admin bo'lsa — admin klaviaturasi).
+ * emas: eski "💬 Chatlar / 🔄 Holat" klaviaturasi olib tashlanadi (panel roli bo'lsa — "⚙️ Admin panel" klaviaturasi).
  * Javobdan oldin kutiladi: Vercel funksiyasi javobdan keyin muzlatilishi mumkin. Xatolar e'tiborsiz.
  */
 async function notifyStaffUser(tgUserId: number | null, text: string, resetKeyboard: boolean): Promise<void> {
   const api = staffApi();
   if (!api || !tgUserId) return;
   try {
+    const panel = resetKeyboard ? can(await getPanelRole(tgUserId).catch(() => null), 'panel') : false;
     await api.sendMessage(tgUserId, text, {
       parse_mode: 'HTML',
-      ...(resetKeyboard ? { reply_markup: mainKeyboard(null, isAdmin(tgUserId)) } : {}),
+      ...(resetKeyboard ? { reply_markup: mainKeyboard(null, panel) } : {}),
     });
   } catch (e) {
     console.warn(`[app/admin] ${tgUserId} ga xabarnoma yuborilmadi:`, redact(tgErrorDescription(e)));
@@ -1295,9 +1372,9 @@ async function adminStaffUpdate(ctx: StaffCtx): Promise<Data> {
     }
     updated = res.staff;
   }
-  // Faollashtirildi / o'chirib qo'yildi — xodimga xabar (o'zini o'zgartirgan admin uchun emas, bot bilan bir xil)
+  // Blokdan chiqarildi / bloklandi (is_active) — xodimga xabar (o'zini o'zgartirgan panel foydalanuvchisi uchun emas, bot bilan bir xil)
   if (updated.is_active !== before.is_active && updated.tg_user_id && updated.tg_user_id !== ctx.user.id) {
-    await notifyStaffUser(updated.tg_user_id, updated.is_active ? STAFF_NOTICE.activated : STAFF_NOTICE.deactivated, false);
+    await notifyStaffUser(updated.tg_user_id, updated.is_active ? BLOCK_NOTICE.unblocked : BLOCK_NOTICE.blocked, false);
   }
   // Havola nomi o'zgardi — xodim eski havolani mijozlarga bergan bo'lishi mumkin: yangisini bilsin (bot bilan bir xil)
   if (linkChanged && updated.tg_user_id && updated.tg_user_id !== ctx.user.id) {
@@ -1413,9 +1490,23 @@ async function adminSettingsSet(ctx: StaffCtx): Promise<Data> {
   return adminSettingsGet();
 }
 
-async function adminStats(): Promise<Data> {
-  const stats = await getStats();
-  return { ...stats, stats };
+/**
+ * Statistika. ROP va developer (can 'complaints') uchun shikoyatlar soni ham: complaints_new (ko'rib chiqilmagan)
+ * va complaints_total (yuborilgan hammasi; draftlar hisobga olinmaydi). Admin uchun bu maydonlar yo'q.
+ */
+async function adminStats(ctx: StaffCtx): Promise<Data> {
+  const withComplaints = can(ctx.panelRole, 'complaints');
+  const [stats, complaintsNew, complaintsTotal] = await Promise.all([
+    getStats(),
+    withComplaints ? countComplaints('new') : Promise.resolve(null),
+    withComplaints ? countComplaints('all') : Promise.resolve(null),
+  ]);
+  const full: Data = { ...stats };
+  if (withComplaints) {
+    full.complaints_new = complaintsNew;
+    full.complaints_total = complaintsTotal;
+  }
+  return { ...full, stats: full, panel_role: ctx.panelRole };
 }
 
 // ───────────────────────────── Marshrutlash ─────────────────────────────
@@ -1465,11 +1556,16 @@ async function dispatch(action: string, ctx: Ctx): Promise<Data> {
     case 'admin.settings.set':
       return adminSettingsSet(requireAdmin(ctx));
     case 'admin.stats':
-      requireAdmin(ctx);
-      return adminStats();
+      return adminStats(requireAdmin(ctx));
     default:
       throw new ApiError(400, 'unknown_action', MSG.unknownAction);
   }
+}
+
+async function dispatchWithContext(action: string, auth: WebAppAuth, parsed: ParsedRequest): Promise<Data> {
+  const ctx = await buildContext(auth, parsed);
+  if (!action) throw bad('bad_request', MSG.noAction);
+  return dispatch(action, ctx);
 }
 
 function errorResponse(e: ApiError): Response {
@@ -1489,9 +1585,9 @@ export async function handleAppRequest(req: Request): Promise<Response> {
     const auth = authenticate(parsed);
     // Deploy migratsiyadan oldin chiqib qolgan bo'lsa — sxema shu yerda (instansiyada bir marta) yangilanadi
     await ensureSchema();
-    const ctx = await buildContext(auth, parsed);
-    if (!action) throw bad('bad_request', MSG.noAction);
-    const data = await dispatch(action, ctx);
+    // sync — eng tez-tez chaqiriladigan amal: xodim yozuvidan faqat kerakli ustunlar o'qiladi (buildSyncContext)
+    const data =
+      action === 'sync' ? await syncAction(await buildSyncContext(auth, parsed)) : await dispatchWithContext(action, auth, parsed);
     return json({ ...data, ok: true });
   } catch (e) {
     if (e instanceof ApiError) return errorResponse(e);

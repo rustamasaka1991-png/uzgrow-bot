@@ -5,10 +5,10 @@ Tizim ikki bot va xodimlar uchun Telegram Mini App'dan iborat:
 | Qism | Kim uchun | Nima qiladi |
 |---|---|---|
 | **Mijozlar boti** — @uzgroww_bot | Mijozlar | Juda sodda: mijoz xodimning shaxsiy havolasi (masalan `https://t.me/uzgroww_bot?start=aziza`) orqali kirsa, hech narsa tanlamasdan darhol o'sha xodim bilan chat boshlanadi. Oddiy `/start` da operator yoki menejer tanlanadi (rasm, lavozim, tavsif, onlayn holati bilan). Mijoz xodimga birinchi marta yozganda bot standart avto-javob beradi, keyin xodimning o'zi javob yozadi. |
-| **Xodimlar boti** — @uzgrow_staff_bot | Operator, menejer, admin | Mijoz xabarlari shu botga keladi. Chatlar ro'yxati, tarix, javob berish, onlayn/oflayn holat. Admin panel orqali xodim qo'shish, tahrirlash va o'chirish. |
+| **Xodimlar boti** — @uzgrow_staff_bot | Operator, menejer, admin, ROP, developer | Mijoz xabarlari shu botga keladi. Chatlar ro'yxati, tarix, javob berish, onlayn/oflayn holat. **⚙️ Admin panel**: xodim qo'shish, tahrirlash, bloklash, o'chirish; ROP uchun **mijozlarga ommaviy xabar** va **shikoyatlar**; developer uchun **🛠 Developer panel**. |
 | **Mini App («💬 Chatlar»)** | Xodimlar va admin | Telegram ichida ochiladigan ilova: Telegram'ga o'xshash chat oynasi, profil (shaxsiy havola bilan) va admin panel. Mijozlar uchun Mini App yo'q — ular faqat bot chatida yozadi. |
 
-**Maxfiylik.** Har bir suhbatni faqat mijoz va u tanlagan xodim ko'radi. Boshqa xodimlar ham, admin ham suhbat matnini ko'ra olmaydi.
+**Maxfiylik.** Har bir suhbatni faqat mijoz va u tanlagan xodim ko'radi. Boshqa xodimlar ham, admin ham suhbat matnini ko'ra olmaydi. Yagona istisno: mijoz shikoyat qilgan suhbatni **ROP va developer** shikoyatni tekshirish uchun faqat o'qiy oladi.
 
 **Saqlash.** Barcha xabarlar Supabase bazasida saqlanadi.
 
@@ -22,7 +22,7 @@ Kerakli hamma narsa tayyor, token va kalitlar lokal `.env` faylida turibdi:
 - mijozlar boti tokeni;
 - xodimlar boti tokeni;
 - Supabase bazasi (jadvallar yaratilgan);
-- admin ID: `6562925011`.
+- developer ID: `6562925011` (`ADMIN_IDS` — developer(lar); admin va ROP bot ichidan qo'shiladi).
 
 > `.env` faylini hech qachon GitHub yoki boshqa ochiq joyga yuklamang. U `.gitignore` da turibdi.
 
@@ -47,7 +47,7 @@ Loyiha papkasida terminal oching va quyidagilarni bajaring.
    | `STAFF_BOT_TOKEN` | ✅ | Xodimlar boti tokeni |
    | `DATABASE_URL` | ✅ | Supabase pooler manzili (port 6543), `.env` dagidek aynan nusxalang |
    | `WEBHOOK_SECRET` | ✅ | Tasodifiy maxfiy satr (`.env` da tayyor) |
-   | `ADMIN_IDS` | ✅ | Admin Telegram ID lari, vergul bilan |
+   | `ADMIN_IDS` | ✅ | **Developer** Telegram ID lari, vergul bilan (barcha huquqlar). Admin va ROP bot ichidagi 🛠 Developer paneldan qo'shiladi |
    | `APP_URL` | — | Bo'sh qolsa, Vercel production domeni avtomatik olinadi |
    | `SETUP_KEY` | — | Faqat HTTP orqali sozlash kerak bo'lsa (pastga qarang) |
 
@@ -86,11 +86,25 @@ npm run setup -- --info
 2. **➕ Xodim qo'shish** ni bosing va ketma-ket kiriting: rol (Operator/Menejer) → ism → lavozim → tavsif → avto-javob matni → rasm. Lavozim, tavsif, avto-javob va rasmni o'tkazib yuborish mumkin.
 3. Bot **taklif havolasi** beradi. Uni o'sha xodimga yuboring. Xodim havolani ochib **Start** bosganda uning Telegram akkaunti profilga ulanadi va u mijozlarga ko'rina boshlaydi.
 4. Xodimning **mijozlar uchun havolasi** ismidan avtomatik yaratiladi (`?start=aziza`). Uni kartadagi «✏️ Havola nomi» tugmasi (yoki Mini App dagi «Havola nomi» maydoni) bilan o'zgartirish mumkin: 2–32 ta lotin harfi, raqam yoki `_`. Nom o'zgarsa, eski havola ishlamay qoladi.
-5. Xodimni istalgan vaqtda tahrirlash, rasmini almashtirish, vaqtincha o'chirib qo'yish, akkauntini uzish yoki o'chirish mumkin. Buni botda ham, Mini App dagi **⚙️ Admin** bo'limida ham qilsa bo'ladi. Xodim o'chirilsa ham suhbatlar tarixi saqlanib qoladi.
+5. Xodimni istalgan vaqtda tahrirlash, rasmini almashtirish, bloklash (🚫), akkauntini uzish yoki o'chirish mumkin. Buni botda ham, Mini App dagi **⚙️ Admin** bo'limida ham qilsa bo'ladi. Xodim o'chirilsa ham suhbatlar tarixi saqlanib qoladi.
 
 > Mijozlarga faqat **faol** va **akkaunti ulangan** xodimlar ko'rinadi. Admin ro'yxatida ⏳ belgisi akkaunt hali ulanmaganini bildiradi.
 
 **Bot matnlari.** Admin panel → «👋 Salomlashuv matni», «🤖 Avto-javob matni», «🕐 Oflayn izohi». Matnlarda `{name}` o'rniga mijoz ismi, `{staff}` o'rniga xodim ismi qo'yiladi. Har bir xodim uchun alohida avto-javob matni ham yozish mumkin.
+
+## 4.1. Rollar: developer, ROP, admin
+
+| Rol | Kim | Nima qila oladi |
+|---|---|---|
+| 🛠 **Developer** | `ADMIN_IDS` dagi ID (hozir `6562925011`) | Hamma narsa + **🛠 Developer panel**: admin va ROP qo'shish/olib tashlash, tizim holati (webhooklar, baza, statistika) |
+| 👑 **ROP (rahbar)** | Developer qo'shadi | To'liq admin paneli + **📣 Mijozlarga xabar** (barcha mijozlarga ommaviy xabar) + **⚠️ Shikoyatlar** (ro'yxat, shikoyat qilingan suhbatni o'qish, «✅ Hal qilindi») |
+| ⚙️ **Admin** (1–2 ta) | Developer qo'shadi | To'liq admin paneli: xodim qo'shish, tahrirlash, **bloklash**, o'chirish, havolalar, bot matnlari, statistika + **📣 Mijozlarga xabar** |
+
+**Admin yoki ROP qo'shish:** @uzgrow_staff_bot → «⚙️ Admin panel» → «🛠 Developer panel» → «➕ Admin qo'shish» / «➕ ROP qo'shish» → o'sha odamning **Telegram ID** raqamini yuboring (u @userinfobot orqali biladi) yoki uning biror xabarini forward qiling. So'ng u @uzgrow_staff_bot ga `/start` yozadi va «⚙️ Admin panel» chiqadi. Olib tashlash — «👥 Adminlar va ROP» ro'yxatidan.
+
+**Ommaviy xabar (admin / ROP / developer):** «📣 Mijozlarga xabar» → matn, rasm, video, fayl yoki ovozli xabar yuboring → bot oldindan ko'rsatadi va «N ta mijozga yuborilsinmi?» deb so'raydi → «✅ Yuborish». Jarayon xabari yuborilganlar, botni bloklaganlar va xatolar sonini ko'rsatib boradi; «✖️ To'xtatish» bilan to'xtatish mumkin. Telegram limiti sababli ~25 ta xabar/soniya (1 000 mijoz ≈ 40 soniya).
+
+**Shikoyatlar:** mijoz `/shikoyat` → yozishgan xodimini tanlaydi → shikoyat matnini yozadi. Shikoyat **xodimga ko'rinmaydi**; ROP va developerga darhol bildirishnoma keladi. «⚠️ Shikoyatlar» da ko'rib chiqib «✅ Hal qilindi» bosilsa, mijozga «shikoyatingiz ko'rib chiqildi» xabari boradi.
 
 ## 5. Qanday ishlaydi
 
@@ -100,6 +114,7 @@ npm run setup -- --info
 - Matn, rasm, video, fayl, ovozli xabar, stiker, joylashuv yoki kontakt yuborishi mumkin.
 - Birinchi xabariga bot bir martalik avto-javob beradi, keyin xodimning javoblari xodim ismi bilan keladi.
 - Boshqa xodimga o'tish uchun `/start`. Xodimning xabariga **Reply** qilsa (yoki «↩️ Javob berish» ni bossa), javob aynan o'sha xodimga boradi.
+- Xodim ustidan shikoyat qilish: `/shikoyat`.
 - Pastki doimiy menyu va Mini App yo'q — bot iloji boricha sodda.
 
 **Xodim:**
@@ -153,3 +168,17 @@ tests/          e2e testlar + soxta Telegram server
 - **Mijozlarga xodim ko'rinmayapti.** Xodim taklif havolasini ochib, xodimlar botida **Start** bosganmi? Admin ro'yxatida ⏳ belgisi akkaunt ulanmaganini bildiradi.
 - **Xodimga xabar kelmayapti.** Xodim botni to'xtatmaganmi? Xabarlar baribir saqlanadi va Mini App dagi «💬 Chatlar» da ko'rinadi. Xodim botga qaytganda xabarlar avtomatik yetkaziladi.
 - **Mini App ochilmayapti.** `npm run setup -- https://<production-domen>` ni qayta ishga tushiring. Vaqtinchalik (preview) manzillar Vercel tomonidan himoyalangan, faqat production domenini ishlating.
+
+## 9. Quvvat va tariflar (o'lchangan)
+
+Bosim testida (500 tagacha bir vaqtda yozgan mijoz, Telegram cheklovlari simulyatsiyasi bilan) **birorta xabar yo'qolmadi, takrorlanmadi yoki noto'g'ri odamga bormadi**.
+
+| Ko'rsatkich | Qiymat |
+|---|---|
+| Umumiy oqim | ~30 xabar/soniya (~100 000/soat) — Telegram limiti |
+| Bir vaqtda faol yozayotgan mijozlar | ~900 (har biri 30 soniyada 1 xabar) |
+| Bitta operatorga | ~60 xabar/daqiqa (ko'pi navbatda kutadi, yo'qolmaydi) |
+| Xabar yetib borish vaqti | ~0,4–1 soniya |
+| Baza (Supabase Free, 500 MB) | ~1,2 million xabar; Pro (8 GB) ~20 million |
+
+**Tavsiya:** Vercel **Hobby** rasman faqat notijorat foydalanish uchun — biznes uchun **Vercel Pro ($20/oy)**. Haqiqiy mijoz ma'lumotlari uchun **Supabase Pro ($25/oy)**: avtomatik backup, pauza yo'q, 250 GB trafik.

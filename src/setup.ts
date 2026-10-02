@@ -3,6 +3,7 @@ import { webhookSecretFor } from './auth.js';
 import { config } from './config.js';
 import { db } from './db.js';
 import { ensureLinkCodes, setSetting } from './repo.js';
+import { panelRecipients } from './roles.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
 import { SETTING_KEYS } from './texts.js';
 import type { Api } from 'grammy';
@@ -65,9 +66,10 @@ export function ensureSchema(): Promise<void> {
  */
 export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'my_chat_member'] as const;
 
-/** Mijozlar boti sodda: faqat boshlash va yordam (Mini App yo'q — menyu tugmasi buyruqlar ro'yxati). */
+/** Mijozlar boti sodda: boshlash, shikoyat va yordam (Mini App yo'q — menyu tugmasi buyruqlar ro'yxati). */
 const CLIENT_COMMANDS = [
   { command: 'start', description: '🔄 Boshlash / xodim tanlash' },
+  { command: 'shikoyat', description: '⚠️ Shikoyat qilish' },
   { command: 'help', description: 'ℹ️ Yordam' },
 ];
 
@@ -81,7 +83,7 @@ export const STAFF_COMMANDS = [
   { command: 'help', description: 'ℹ️ Yordam' },
 ];
 
-/** Adminlar uchun (faqat ularning chatida ko'rinadi): umumiy buyruqlar + /admin. */
+/** Panel foydalanuvchilari (developer, ROP, admin) uchun (faqat ularning chatida): umumiy buyruqlar + /admin. */
 export const STAFF_ADMIN_COMMANDS = [
   STAFF_COMMANDS[0]!,
   { command: 'admin', description: '⚙️ Admin panel' },
@@ -194,7 +196,7 @@ async function setupBot(kind: BotKind, appUrl: string): Promise<BotSetupResult> 
     await api.setMyCommands(kind === 'client' ? CLIENT_COMMANDS : STAFF_COMMANDS);
     if (kind === 'staff') {
       // Admin botni hali ochmagan bo'lsa ("chat not found") — /start bosganda o'rnatiladi
-      for (const id of config.adminIds) await setAdminCommands(api, id).catch(() => {});
+      for (const id of await panelRecipients('panel')) await setAdminCommands(api, id).catch(() => {});
     }
     // Mijozlarda Mini App yo'q: menyu tugmasi oddiy buyruqlar ro'yxati. Xodimlarda — «💬 Chatlar» Mini App.
     await api.setChatMenuButton({

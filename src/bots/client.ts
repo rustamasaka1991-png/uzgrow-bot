@@ -10,6 +10,17 @@ import type {
   ReplyKeyboardRemove,
   ReplyParameters,
 } from 'grammy/types';
+import {
+  appendComplaintText,
+  cancelComplaintDrafts,
+  expireComplaintDrafts,
+  getActiveDraft,
+  notifyComplaintAddition,
+  notifyNewComplaint,
+  startComplaintDraft,
+  submitComplaint,
+  type ComplaintView,
+} from '../complaints.js';
 import { config } from '../config.js';
 import { relayErrorText } from '../relay.js';
 import {
@@ -33,20 +44,46 @@ import { welcomeText } from '../texts.js';
 import { extractContent, retryOnFlood } from '../tg.js';
 import type { Client, Conversation, Role, Staff } from '../types.js';
 import { hitRateLimit, type RateRule } from '../webapp/guards.js';
-import { dativeSuffix, esc, isNotModified, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
+import { dativeSuffix, describeError, esc, isNotModified, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
+import {
+  COMPLAINT_ABANDONED_SEC,
+  COMPLAINT_ADD_RULES,
+  COMPLAINT_FOLLOWUP_SEC,
+  COMPLAINT_RACE_GUARD_SEC,
+  COMPLAINT_RATE_RULES,
+  CT,
+  complaintAcceptedText,
+  complaintCancelMarkup,
+  complaintFollowUpText,
+  complaintPromptText,
+  complaintSentPromptText,
+  complaintStaffName,
+  renderComplaintPicker,
+} from './client/complaint.js';
 import { withStaffPhoto } from './client/photo.js';
 import {
+  boundComplaintGuard,
+  clearComplaintGuard,
   clearSelection,
+  complaintTarget,
   conversationFromNamedStaff,
   conversationStaff,
+  complaintDraftInfo,
+  getComplaintMarks,
+  guardApplies,
+  hasComplaintDraft,
   heldItemFrom,
   holdMessages,
   isUnexpectedTarget,
   loadRouteInfo,
+  markComplaintAlbum,
   recentContacts,
   relayQueue,
+  setComplaintGuard,
+  setComplaintPrompt,
   takeHeld,
   targetFromBotMessage,
+  type ComplaintGuard,
   type ErrorReporter,
   type HeldItem,
   type QueueOutcome,
@@ -137,9 +174,11 @@ function callbackMessageHasMedia(ctx: Context): boolean {
 /**
  * Callback kelgan xabarni tahrirlash; iloji bo'lmasa (juda eski, o'chirilgan, rasmli xabar) — yangisini yuborish.
  * Rasmli karta ro'yxatga qaytganda karta o'chiriladi va ro'yxat yangi xabar sifatida yuboriladi.
+ * replyMarkup berilmasa — tugmalar olib tashlanadi. Natija: ko'rsatilgan (tahrirlangan yoki yangi) xabar id si.
  */
-async function editOrSend(ctx: Context, text: string, replyMarkup: InlineKeyboardMarkup): Promise<void> {
-  if (ctx.callbackQuery?.message) {
+async function editOrSend(ctx: Context, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<number | undefined> {
+  const current = ctx.callbackQuery?.message;
+  if (current) {
     if (callbackMessageHasMedia(ctx)) {
       await ctx.deleteMessage().catch(() => {});
     } else {
@@ -147,21 +186,44 @@ async function editOrSend(ctx: Context, text: string, replyMarkup: InlineKeyboar
         await ctx.editMessageText(text, {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
-          reply_markup: replyMarkup,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
         });
-        return;
+        return current.message_id;
       } catch (e) {
-        if (isNotModified(e)) return;
+        if (isNotModified(e)) return current.message_id;
         if (tgErrorCode(e) === 403) throw e;
         console.warn('[client] editMessageText bajarilmadi, yangi xabar yuboriladi:', tgErrorDescription(e));
       }
     }
   }
-  await sendHtml(ctx, text, replyMarkup);
+  return (await sendHtml(ctx, text, replyMarkup)).message_id;
 }
 
 async function showUploadAction(ctx: Context): Promise<void> {
   await ctx.replyWithChatAction('upload_photo').catch(() => {});
+}
+
+/**
+ * Amal bajarilgandan KEYINGI bildirishnoma (xabar xodimga yetkazildi / navbatga saqlandi / shikoyat qabul qilindi,
+ * keyin — izoh, tasdiq, rasm): eng yaxshi urinish. Xato faqat logga yoziladi va xato chegarasiga (handleError →
+ * T.error «qayta urinib ko'ring») CHIQMAYDI — aks holda mijoz xabarini qayta yuboradi va xodim uni ikki marta oladi
+ * (yoki shikoyat matni xodimning o'ziga ketib qoladi). Mijoz botni bloklagan bo'lsa (403) — odatdagidek belgilanadi.
+ * Natija: fn qaytargan qiymat, xatoda undefined.
+ */
+async function afterSuccess<T>(ctx: Context, where: string, fn: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await fn();
+  } catch (e) {
+    console.warn(`[client] update #${ctx.update.update_id}: ${where} (amal bajarilgan, xato e'tiborsiz):`, describeError(e));
+    if (tgErrorCode(e) === 403 && ctx.from) await setClientBlocked(ctx.from.id, true).catch(() => {});
+    return undefined;
+  }
+}
+
+/** `committed` bo'lsa — afterSuccess (eng yaxshi urinish), aks holda odatdagidek (xato chegarasigacha). */
+async function afterIf(ctx: Context, committed: boolean, where: string, fn: () => Promise<unknown>): Promise<void> {
+  if (committed) await afterSuccess(ctx, where, fn);
+  else await fn();
 }
 
 /**
@@ -307,6 +369,8 @@ async function sendTranscript(
  * saqlab qo'yilgan xabarlar shu suhbatga yuboriladi.
  */
 async function deliverHeldOnSelect(ctx: Context, client: Client, conv: Conversation): Promise<QueueOutcome | null> {
+  // Mijoz shu xodimga yozishni o'zi aniq tanladi — shikoyatdan keyingi himoya (bo'lsa) olib tashlanadi
+  await clearComplaintGuard(client.tg_user_id, conv.staff_id);
   const held = await takeHeld(client.tg_user_id, conv.id);
   if (!held.length) return null;
   return relayQueue(client, conv, held, botErrorReporter(ctx));
@@ -317,6 +381,7 @@ async function deliverHeldOnSelect(ctx: Context, client: Client, conv: Conversat
  * current — mijozning hozirgi xabari (bo'lsa): albomning keyingi qismlariga qayta javob yozilmaydi.
  * Mijozning boshqa faol suhbati qolgan bo'lsa (Reply orqali mavjud bo'lmagan xodimga yozgan), hozirgi xabar
  * saqlanmaydi — aks holda u keyingi xabar bilan faol suhbatdagi boshqa xodimga so'ralmasdan ketib qolardi.
+ * relayed — navbatdagi xabarlarning bir qismi xodimga allaqachon yetkazilgan (bildirishnoma — eng yaxshi urinish).
  */
 async function onStaffUnavailable(
   ctx: Context,
@@ -324,6 +389,7 @@ async function onStaffUnavailable(
   conv: Conversation,
   rest: HeldItem[],
   current?: HeldItem,
+  relayed = false,
 ): Promise<void> {
   if (client.active_conversation_id === conv.id) {
     await setClientActiveConversation(client.tg_user_id, null);
@@ -342,17 +408,17 @@ async function onStaffUnavailable(
   let note = '';
   if (current && rest.includes(current) && !holdCurrent) note = T.notSentNote;
   else if (toHold.length) note = saved ? T.heldNote : T.resendNote;
-  await sendHtml(
-    ctx,
-    esc(relayErrorText('staff_unavailable')) + (note ? `\n\n${note}` : ''),
-    markup([roleRow()]),
-    current?.msgId,
+  // Xabarlar saqlangan (yoki bir qismi yetkazilgan) bo'lsa — «qayta urinib ko'ring» takror xabarga olib keladi
+  await afterIf(ctx, saved || relayed, "«xodim mavjud emas» izohi", () =>
+    sendHtml(ctx, esc(relayErrorText('staff_unavailable')) + (note ? `\n\n${note}` : ''), markup([roleRow()]), current?.msgId),
   );
 }
 
 /** Tanlangan xodim bilan suhbatni faollashtirish. */
 async function pickStaff(ctx: Context, staff: Staff): Promise<void> {
   const client = clientOf(ctx);
+  // Mijoz xodimga yozishni tanladi — ochiq shikoyat drafti (bo'lsa) bekor qilinadi (keyingi xabar xodimga boradi)
+  await dropComplaintDraft(ctx, client.tg_user_id);
   const conv = await getOrCreateConversation(client.tg_user_id, staff.id);
   await setClientActiveConversation(client.tg_user_id, conv.id);
   client.active_conversation_id = conv.id;
@@ -361,15 +427,18 @@ async function pickStaff(ctx: Context, staff: Staff): Promise<void> {
   // Xodim tanlanmaguncha yozilgan xabarlar — endi shu xodimga (avto-javob relay ichida, bir marta)
   const out = await deliverHeldOnSelect(ctx, client, conv);
   if (out?.unavailable) {
-    await onStaffUnavailable(ctx, client, conv, out.rest);
+    await onStaffUnavailable(ctx, client, conv, out.rest, undefined, out.sent > 0);
     return;
   }
   const existing = conv.last_message_at != null;
-  if (existing) await markReadByClient(conv.id);
-  // Eski doimiy klaviatura (bo'lsa) shu xabar bilan olib tashlanadi — shuning uchun inline tugma yo'q
-  const text = pickedText({ staff, existing, heldSent: out?.sent ?? 0, undelivered: !!out?.undelivered });
-  await sendHtml(ctx, text, REMOVE_KEYBOARD);
-  await dropLegacyKeyboard(ctx, true);
+  // Saqlangan xabarlar yetkazilgan bo'lsa — keyingi tasdiq eng yaxshi urinish (takror yuborishga undamaslik uchun)
+  await afterIf(ctx, (out?.sent ?? 0) > 0, 'xodim tanlangani haqidagi xabar', async () => {
+    if (existing) await markReadByClient(conv.id);
+    // Eski doimiy klaviatura (bo'lsa) shu xabar bilan olib tashlanadi — shuning uchun inline tugma yo'q
+    const text = pickedText({ staff, existing, heldSent: out?.sent ?? 0, undelivered: !!out?.undelivered });
+    await sendHtml(ctx, text, REMOVE_KEYBOARD);
+    await dropLegacyKeyboard(ctx, true);
+  });
 }
 
 /**
@@ -388,30 +457,33 @@ async function startWithStaff(ctx: Context, staff: Staff): Promise<void> {
   // takeHeld shu suhbatni "botda aniq tanlangan" deb belgilaydi (keyingi xabarda "boshqa xodimga ketdi" izohi chiqmaydi).
   const out = await deliverHeldOnSelect(ctx, client, conv);
   if (out?.unavailable) {
-    await onStaffUnavailable(ctx, client, conv, out.rest);
+    await onStaffUnavailable(ctx, client, conv, out.rest, undefined, out.sent > 0);
     return;
   }
-  if (existing) await markReadByClient(conv.id);
 
-  const caption = linkWelcomeCaption({
-    clientName: client.first_name,
-    staff,
-    existing,
-    heldSent: out?.sent ?? 0,
-    undelivered: !!out?.undelivered,
-  });
-  try {
-    await withStaffPhoto(
+  // Saqlangan xabarlar yetkazilgan bo'lsa — rasm/izoh eng yaxshi urinish (takror yuborishga undamaslik uchun)
+  await afterIf(ctx, (out?.sent ?? 0) > 0, 'havola orqali ulanish xabari', async () => {
+    if (existing) await markReadByClient(conv.id);
+    const caption = linkWelcomeCaption({
+      clientName: client.first_name,
       staff,
-      (media) => ctx.replyWithPhoto(media, { caption, parse_mode: 'HTML', reply_markup: REMOVE_KEYBOARD }),
-      () => showUploadAction(ctx),
-    );
-  } catch (e) {
-    if (tgErrorCode(e) === 403) throw e;
-    console.error(`[client] xodim #${staff.id} rasmini yuborib bo'lmadi, matn yuboriladi:`, tgErrorDescription(e));
-    await sendHtml(ctx, caption, REMOVE_KEYBOARD);
-  }
-  await dropLegacyKeyboard(ctx, true);
+      existing,
+      heldSent: out?.sent ?? 0,
+      undelivered: !!out?.undelivered,
+    });
+    try {
+      await withStaffPhoto(
+        staff,
+        (media) => ctx.replyWithPhoto(media, { caption, parse_mode: 'HTML', reply_markup: REMOVE_KEYBOARD }),
+        () => showUploadAction(ctx),
+      );
+    } catch (e) {
+      if (tgErrorCode(e) === 403) throw e;
+      console.error(`[client] xodim #${staff.id} rasmini yuborib bo'lmadi, matn yuboriladi:`, tgErrorDescription(e));
+      await sendHtml(ctx, caption, REMOVE_KEYBOARD);
+    }
+    await dropLegacyKeyboard(ctx, true);
+  });
 }
 
 /** /start payload: `staff_<id>` (eski havolalar) yoki xodimning havola nomi (katta-kichik harf farqsiz). */
@@ -520,18 +592,21 @@ async function resolveConversation(client: Client, msg: TgMessage, botId: number
 async function askRecipient(ctx: Context, client: Client, item: HeldItem): Promise<void> {
   const held = await holdMessages(client.tg_user_id, [item]);
   if (held.saved && item.group && held.count > 1 && held.prev?.group === item.group) return;
-  const choices: Array<{ conversationId: number; staff: Staff }> = [];
-  if (client.active_conversation_id != null) {
-    const activeStaff = await conversationStaff(client.active_conversation_id, client.tg_user_id);
-    if (isStaffAvailable(activeStaff)) choices.push({ conversationId: client.active_conversation_id, staff: activeStaff });
-  }
-  for (const r of await recentContacts(client.tg_user_id)) {
-    if (choices.length >= 4) break;
-    if (isStaffAvailable(r.staff) && !choices.some((c) => c.conversationId === r.conversationId)) choices.push(r);
-  }
-  const rows: Rows = choices.map((c) => [writeToButton(c.conversationId, staffName(c.staff))]);
-  rows.push(roleRow());
-  await sendHtml(ctx, held.saved ? T.askRecipient : T.askRecipientFull, markup(rows), item.msgId);
+  // Xabar saqlangan bo'lsa — so'rov eng yaxshi urinish (qayta yuborilsa, u ikki marta saqlanib, ikki marta ketardi)
+  await afterIf(ctx, held.saved, '«Bu xabar kimga?» so\'rovi', async () => {
+    const choices: Array<{ conversationId: number; staff: Staff }> = [];
+    if (client.active_conversation_id != null) {
+      const activeStaff = await conversationStaff(client.active_conversation_id, client.tg_user_id);
+      if (isStaffAvailable(activeStaff)) choices.push({ conversationId: client.active_conversation_id, staff: activeStaff });
+    }
+    for (const r of await recentContacts(client.tg_user_id)) {
+      if (choices.length >= 4) break;
+      if (isStaffAvailable(r.staff) && !choices.some((c) => c.conversationId === r.conversationId)) choices.push(r);
+    }
+    const rows: Rows = choices.map((c) => [writeToButton(c.conversationId, staffName(c.staff))]);
+    rows.push(roleRow());
+    await sendHtml(ctx, held.saved ? T.askRecipient : T.askRecipientFull, markup(rows), item.msgId);
+  });
 }
 
 /**
@@ -547,19 +622,22 @@ async function holdMessage(ctx: Context, client: Client, item: HeldItem): Promis
   }
   if (held.count > 1) {
     if (item.group && held.prev?.group === item.group) return;
-    await sendHtml(ctx, T.chooseFirstMore, kb, item.msgId);
+    await afterSuccess(ctx, '«saqlandi» izohi', () => sendHtml(ctx, T.chooseFirstMore, kb, item.msgId));
     return;
   }
-  // Oxirgi xodimi endi mavjud emas (uzilgan/o'chirilgan) — sababini aytamiz.
-  // Avval yozishgan va hali mavjud xodim bo'lsa — unga bir bosishda yozish tugmasi (saqlangan xabar ham ketadi).
-  const recent = await recentContacts(client.tg_user_id);
-  const last = recent[0];
-  const text = last && !isStaffAvailable(last.staff) ? staffGoneText(staffName(last.staff)) : T.chooseFirst;
-  const rows: Rows = [];
-  const quick = recent.find((r) => isStaffAvailable(r.staff));
-  if (quick) rows.push([writeToButton(quick.conversationId, staffName(quick.staff))]);
-  rows.push(roleRow());
-  await sendHtml(ctx, text, markup(rows), item.msgId);
+  // Xabar saqlandi — izoh eng yaxshi urinish (qayta yuborilsa, u ikki marta saqlanib, ikki marta ketardi).
+  await afterSuccess(ctx, '«saqlandi» izohi', async () => {
+    // Oxirgi xodimi endi mavjud emas (uzilgan/o'chirilgan) — sababini aytamiz.
+    // Avval yozishgan va hali mavjud xodim bo'lsa — unga bir bosishda yozish tugmasi (saqlangan xabar ham ketadi).
+    const recent = await recentContacts(client.tg_user_id);
+    const last = recent[0];
+    const text = last && !isStaffAvailable(last.staff) ? staffGoneText(staffName(last.staff)) : T.chooseFirst;
+    const rows: Rows = [];
+    const quick = recent.find((r) => isStaffAvailable(r.staff));
+    if (quick) rows.push([writeToButton(quick.conversationId, staffName(quick.staff))]);
+    rows.push(roleRow());
+    await sendHtml(ctx, text, markup(rows), item.msgId);
+  });
 }
 
 /**
@@ -582,6 +660,52 @@ async function withinBotRate(ctx: Context, client: Client, msgId: number): Promi
   const notice = await hitRateLimit(`c:${client.tg_user_id}:bot-notice`, FLOOD_NOTICE_RULES);
   if (notice.allowed) await sendHtml(ctx, tooFastText(verdict.retryAfterSec), undefined, msgId);
   return false;
+}
+
+/**
+ * Shikoyatdan (yoki shikoyat oynasi yopilgandan) keyin darhol shikoyat qilingan xodimga yozilgan xabar: unga
+ * yuborilmaydi. Yuborilgan shikoyat bo'lsa — matni (izohi) shikoyatga qo'shiladi va rahbariyat xabardor qilinadi;
+ * mijozga izoh + «↩️ … ga yozish» tugmasi (bosilsa himoya olib tashlanadi). Albomning qolgan qismlari jimgina
+ * ushlanadi (interceptComplaint, cmpAlbum).
+ */
+async function guardedFollowUp(
+  ctx: Context,
+  client: Client,
+  conv: Conversation,
+  msg: TgMessage,
+  guard: ComplaintGuard,
+): Promise<void> {
+  const clientId = client.tg_user_id;
+  if (msg.media_group_id) await markComplaintAlbum(clientId, msg.media_group_id);
+  if (guard.id == null) {
+    console.log(`[client] mijoz ${clientId}: shikoyat oynasi yopilayotganda kelgan xabar xodim #${conv.staff_id} ga yuborilmadi`);
+    await afterSuccess(ctx, 'parallel xabar izohi', () => sendHtml(ctx, CT.raced, undefined, msg.message_id));
+    return;
+  }
+  const body = (msg.text ?? msg.caption ?? '').trim();
+  let added: ComplaintView | null = null;
+  if (body) {
+    const verdict = await hitRateLimit(`c:${clientId}:complaint-add`, COMPLAINT_ADD_RULES);
+    if (verdict.allowed) added = await appendComplaintText(guard.id, clientId, body);
+  }
+  console.log(
+    `[client] mijoz ${clientId}: shikoyatdan keyingi xabar xodim #${conv.staff_id} ga yuborilmadi` +
+      (added ? ` (shikoyat #${added.id} ga qo'shildi)` : ''),
+  );
+  // Bu yerdan pastda hammasi eng yaxshi urinish (matn shikoyatga allaqachon qo'shilgan)
+  if (added) {
+    try {
+      await notifyComplaintAddition(added, body);
+    } catch (e) {
+      console.warn(`[client] shikoyat #${added.id} qo'shimchasi bildirishnomasi:`, describeError(e));
+    }
+  }
+  await afterSuccess(ctx, 'shikoyatdan keyingi xabar izohi', async () => {
+    const staff = await getStaff(conv.staff_id);
+    const name = staffName(staff);
+    const kb = isStaffAvailable(staff) ? markup([[writeToButton(conv.id, name)]]) : undefined;
+    await sendHtml(ctx, complaintFollowUpText(name, added ? added.id : null), kb, msg.message_id);
+  });
 }
 
 async function routeClientMessage(ctx: Context): Promise<void> {
@@ -614,6 +738,11 @@ async function routeClientMessage(ctx: Context): Promise<void> {
     await askRecipient(ctx, client, item);
     return;
   }
+  // Shikoyatdan keyingi himoya: shikoyat qilingan xodimga ketayotgan xabar unga YUBORILMAYDI (shikoyatga qo'shiladi)
+  if (conv && guardApplies(info.cmpGuard, conv.staff_id, msg.message_id)) {
+    await guardedFollowUp(ctx, client, conv, msg, info.cmpGuard);
+    return;
+  }
   if (!conv) {
     await holdMessage(ctx, client, item);
     return;
@@ -626,23 +755,32 @@ async function routeClientMessage(ctx: Context): Promise<void> {
   const held = info.hasHeld ? await takeHeld(client.tg_user_id, null) : [];
   const out = await relayQueue(client, conv, [...held, item], botErrorReporter(ctx));
   if (out.unavailable) {
-    await onStaffUnavailable(ctx, client, conv, out.rest, item);
+    await onStaffUnavailable(ctx, client, conv, out.rest, item, out.sent > 0);
     return;
   }
   if (!out.sent) return; // xatolar xabarma-xabar aytildi
 
+  // ── Bu yerdan pastda hammasi eng yaxshi urinish: xabar(lar) xodimga allaqachon yetkazilgan (saqlangan).
+  //    Xato xato chegarasiga chiqsa, mijoz «qayta urinib ko'ring» ni ko'rib, xabarini qayta yuboradi — xodim uni
+  //    ikki marta oladi.
+
   // Mijoz yozdi — demak shu suhbatdagi xabarlarni ko'rgan (keraksiz yozuvdan qochamiz)
   if (conv.unread_client > 0) {
-    await markReadByClient(conv.id).catch((e) => console.warn('[client] markReadByClient:', e));
+    await markReadByClient(conv.id).catch((e) => console.warn('[client] markReadByClient:', describeError(e)));
   }
 
   // 3) Reply orqali boshqa suhbatga yozgan bo'lsa — endi shu suhbat faol
   let switched = false;
   if (viaReply && client.active_conversation_id !== conv.id) {
     const previous = client.active_conversation_id;
-    await setClientActiveConversation(client.tg_user_id, conv.id);
-    client.active_conversation_id = conv.id;
-    switched = previous != null;
+    const changed = await afterSuccess(ctx, 'faol suhbatni almashtirish', async () => {
+      await setClientActiveConversation(client.tg_user_id, conv.id);
+      return true;
+    });
+    if (changed) {
+      client.active_conversation_id = conv.id;
+      switched = previous != null;
+    }
   }
 
   // 4) Bildirishnomalar (bitta xabarda): o'tish, saqlangan xabarlar, "boshqa xodimga ketdi", yetkazilmadi
@@ -653,27 +791,185 @@ async function routeClientMessage(ctx: Context): Promise<void> {
     !viaReply && !held.length && sentIds.has(item.msgId) && isUnexpectedTarget(info, conv.id);
   // Tanlov belgisi ishlatildi: endi chatdagi oxirgi xabar shu suhbatniki
   if (info.selConvId != null && sentIds.has(item.msgId)) {
-    await clearSelection(client.tg_user_id, info.selConvId).catch((e) => console.warn('[client] clearSelection:', e));
+    await clearSelection(client.tg_user_id, info.selConvId).catch((e) => console.warn('[client] clearSelection:', describeError(e)));
   }
   if (!switched && !heldSent && !redirected && !out.undelivered) return;
 
-  const staff = await getStaff(conv.staff_id);
-  const name = staffName(staff);
-  const parts: string[] = [];
-  const rows: Rows = [];
-  if (switched) parts.push(switchedNote(name));
-  if (heldSent) parts.push(heldSentLine(heldSent, name));
-  if (redirected && info.lastConvId != null) {
-    const prev = await conversationStaff(info.lastConvId, client.tg_user_id);
-    const canWriteBack = isStaffAvailable(prev);
-    parts.push(redirectedNote(name, staffName(prev), canWriteBack));
-    if (canWriteBack) rows.push([writeToButton(info.lastConvId, staffName(prev))]);
+  await afterSuccess(ctx, 'yetkazishdan keyingi izoh', async () => {
+    const staff = await getStaff(conv.staff_id);
+    const name = staffName(staff);
+    const parts: string[] = [];
+    const rows: Rows = [];
+    if (switched) parts.push(switchedNote(name));
+    if (heldSent) parts.push(heldSentLine(heldSent, name));
+    if (redirected && info.lastConvId != null) {
+      const prev = await conversationStaff(info.lastConvId, client.tg_user_id);
+      const canWriteBack = isStaffAvailable(prev);
+      parts.push(redirectedNote(name, staffName(prev), canWriteBack));
+      if (canWriteBack) rows.push([writeToButton(info.lastConvId, staffName(prev))]);
+    }
+    if (out.undelivered) {
+      parts.push(undeliveredNote(name));
+      rows.push(roleRow());
+    }
+    await sendHtml(ctx, parts.join('\n\n'), rows.length ? markup(rows) : undefined, msg.message_id);
+  });
+}
+
+// ───────────────────────────── Shikoyat (/shikoyat) ─────────────────────────────
+// Mijoz xodimni tanlagach (draft), keyingi matnli xabari shikoyat bo'ladi. Draft bor paytda kelgan xabar HECH QACHON
+// xodimga yuborilmaydi: u saqlangan xabarlar, yo'naltirish va relay dan OLDIN ushlanadi. Tahrirlari ham yetib
+// bormaydi (xabar bazada yo'q — src/edits.ts uni topmaydi).
+
+/** Eski doimiy pastki klaviatura yorliqlari — buyruq kabi (shikoyat draftini bekor qiladi). */
+const LEGACY_BUTTON_TEXTS: ReadonlySet<string> = new Set(Object.values(BTN));
+
+/** Buyruq (/start, /help, …, noma'lum /buyruq ham) yoki eski pastki menyu tugmasi. */
+function isCommandLike(msg: TgMessage): boolean {
+  return msg.text !== undefined && (COMMAND_RE.test(msg.text) || LEGACY_BUTTON_TEXTS.has(msg.text));
+}
+
+/**
+ * Draftning so'rov xabarini (✍️ … ustidan shikoyatingizni yozing + ✖️ Bekor qilish) yopish: matni almashtiriladi va
+ * tugma olib tashlanadi — mijoz shikoyat oynasi yopilganini ko'radi. Eng yaxshi urinish (xatolar faqat logga).
+ * except — shu xabar bo'lsa tegilmaydi (u chaqiruvchining o'zi tahrirlaydigan xabar).
+ */
+async function closeComplaintPrompt(ctx: Context, clientId: number, html: string, except?: number): Promise<void> {
+  try {
+    const { promptMsgId } = await getComplaintMarks(clientId);
+    if (promptMsgId == null || promptMsgId === except) return;
+    await ctx.api.editMessageText(ctx.chat?.id ?? clientId, promptMsgId, html, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (e) {
+    if (!isNotModified(e)) console.warn('[client] shikoyat so\'rovi xabarini yopib bo\'lmadi:', tgErrorDescription(e));
   }
-  if (out.undelivered) {
-    parts.push(undeliveredNote(name));
-    rows.push(roleRow());
+}
+
+/** Mijozning shikoyat draftini (bo'lsa, eskirganini ham) jimgina bekor qilish; so'rov xabari yopiladi. */
+async function dropComplaintDraft(ctx: Context, clientId: number, except?: number): Promise<boolean> {
+  // Odatdagi holat (draft yo'q) — faqat yengil o'qish so'rovi
+  if (!(await hasComplaintDraft(clientId))) return false;
+  const cancelled = await cancelComplaintDrafts(clientId);
+  if (cancelled) await closeComplaintPrompt(ctx, clientId, CT.cancelled, except);
+  return cancelled;
+}
+
+/** /shikoyat (/complaint): mijozning xabari bor suhbatlari — kim ustidan shikoyat qilishini tanlaydi. */
+async function showComplaintPicker(ctx: Context): Promise<void> {
+  await dropLegacyKeyboard(ctx, false);
+  const client = clientOf(ctx);
+  // Xabarsiz suhbatlar (last_message_at null) ro'yxat oxirida — shuning uchun birinchi 10 tasi yetarli
+  const convs = await listClientConversations(client.tg_user_id, 10);
+  const view = renderComplaintPicker(convs);
+  await sendHtml(ctx, view.text, view.markup);
+}
+
+/**
+ * Har bir kiruvchi xabar uchun ENG AVVAL: shikoyat drafti bo'lsa, xabar shikoyat sifatida qayta ishlanadi (true —
+ * boshqa hech narsa qilinmaydi). Buyruqlar draftni jimgina bekor qiladi va odatdagidek ishlaydi (false).
+ */
+async function interceptComplaint(ctx: Context): Promise<boolean> {
+  const msg = ctx.message;
+  if (!msg) return false;
+  const clientId = clientOf(ctx).tg_user_id;
+  if (isCommandLike(msg)) {
+    await dropComplaintDraft(ctx, clientId);
+    return false;
   }
-  await sendHtml(ctx, parts.join('\n\n'), rows.length ? markup(rows) : undefined, msg.message_id);
+
+  const group = msg.media_group_id;
+  // Odatdagi holat (draft yo'q) — bitta yengil so'rov
+  const latest = await complaintDraftInfo(clientId);
+  if (latest === null) {
+    // Shikoyat bo'lgan albomning qolgan qismlari (alohida update bo'lib keladi) — hech kimga yuborilmaydi.
+    // Shikoyatdan keyin shikoyat qilingan xodimga yozilgan boshqa xabarlar — routeClientMessage dagi himoya (cmpGuard)
+    return !!group && (await getComplaintMarks(clientId)).album === group;
+  }
+  const draftAge = latest.ageSec;
+  const draft = await getActiveDraft(clientId);
+  if (!draft && draftAge > COMPLAINT_ABANDONED_SEC) {
+    // Uzoq (bir kundan ko'p) tashlab ketilgan draft: bu xabar endi shikoyat davomi emas — draft jimgina bekor
+    // qilinadi (so'rov xabari yopiladi) va xabar odatdagidek xodimga boradi
+    await dropComplaintDraft(ctx, clientId);
+    return false;
+  }
+  if (!draft) {
+    // Muddati o'tgan draft: mijoz "shikoyatingizni yozing" xabaridan keyin yozdi — xabar shikoyat bo'lishi mumkin,
+    // shuning uchun xodimga YUBORILMAYDI. Draft o'chiriladi — keyingi xabarlar odatdagidek xodimga boradi.
+    // Himoya va albom belgisi draft o'chirilishidan OLDIN yoziladi: parallel kelgan albom qismi yoki xabar draftni
+    // topmasa ham ushlanadi (xodimga ketmaydi). Himoya izoh xabarigacha yozilgan xabarlar bilan chegaralanadi —
+    // izohni o'qib qayta yuborilgan xabar odatdagidek xodimga boradi.
+    const staffId = latest.staffId;
+    await setComplaintGuard(clientId, { id: null, staff: staffId, until: Date.now() + COMPLAINT_RACE_GUARD_SEC * 1000 }, group);
+    await dropComplaintDraft(ctx, clientId);
+    // Draft endi yo'q: «qayta urinib ko'ring» dan keyin qayta yuborilgan (shikoyat) matni xodimga ketib qolardi
+    const note = await afterSuccess(ctx, 'shikoyat muddati tugagani haqidagi izoh', () =>
+      sendHtml(ctx, CT.expired, undefined, msg.message_id),
+    );
+    if (note) await afterSuccess(ctx, 'shikoyat himoyasi chegarasi', () => boundComplaintGuard(clientId, staffId, note.message_id));
+    return true;
+  }
+
+  const body = (msg.text ?? msg.caption ?? '').trim();
+  if (!body) {
+    // Servis xabarlar (avto-o'chirish taymeri va h.k.) — e'tiborsiz; draft saqlanadi
+    if (!extractContent(msg) && !isUnsupportedUserContent(msg)) return true;
+    if (group) {
+      // Albomga bir marta javob yoziladi
+      if ((await getComplaintMarks(clientId)).album === group) return true;
+      await markComplaintAlbum(clientId, group);
+    }
+    await sendHtml(ctx, CT.textOnly, undefined, msg.message_id);
+    return true;
+  }
+
+  // Albom: izohli qismi shikoyat bo'ladi, qolgan qismlari (keyinroq keladi) — hech kimga yuborilmaydi.
+  // Shikoyatdan keyingi himoya ham shikoyat yuborilishidan OLDIN (shu draft id si bilan — u shikoyat id si bo'ladi):
+  // keyingi xabarlar (Telegram bo'lib yuborgan uzun matnning davomi, izohsiz isbot rasmi, parallel xabar) shikoyat
+  // qilingan xodimga ketmaydi.
+  await setComplaintGuard(
+    clientId,
+    { id: draft.id, staff: draft.staff_id, until: Date.now() + COMPLAINT_FOLLOWUP_SEC * 1000 },
+    group,
+  );
+
+  const verdict = await hitRateLimit(`c:${clientId}:complaint`, COMPLAINT_RATE_RULES);
+  if (!verdict.allowed) {
+    console.warn(`[client] ${clientId}: shikoyatlar chastotasi limiti — shikoyat qabul qilinmadi`);
+    // Shikoyat yo'q: faqat parallel kelgan xabarlar uchun qisqa himoya (izohdan keyin qayta yuborilgani — xodimga)
+    await setComplaintGuard(clientId, {
+      id: null,
+      staff: draft.staff_id,
+      until: Date.now() + COMPLAINT_RACE_GUARD_SEC * 1000,
+    });
+    await dropComplaintDraft(ctx, clientId);
+    const note = await afterSuccess(ctx, 'shikoyatlar limiti izohi', () => sendHtml(ctx, CT.tooMany, undefined, msg.message_id));
+    if (note) {
+      await afterSuccess(ctx, 'shikoyat himoyasi chegarasi', () => boundComplaintGuard(clientId, draft.staff_id, note.message_id));
+    }
+    return true;
+  }
+
+  const view = await submitComplaint(draft.id, clientId, body);
+  if (!view) {
+    await afterSuccess(ctx, 'shikoyat topilmadi izohi', () => sendHtml(ctx, CT.gone, undefined, msg.message_id));
+    return true;
+  }
+  console.log(`[client] mijoz ${clientId}: shikoyat #${view.id} (xodim #${view.staff_id})`);
+  try {
+    await notifyNewComplaint(view);
+  } catch (e) {
+    console.warn(`[client] shikoyat #${view.id} bildirishnomasi:`, describeError(e));
+  }
+  // Shikoyat qabul qilindi (draft yopildi) — tasdiq eng yaxshi urinish: «qayta urinib ko'ring» dan keyin qayta
+  // yuborilgan shikoyat matni endi shikoyat emas, oddiy xabar bo'lib o'sha xodimning o'ziga ketib qolardi
+  await afterSuccess(ctx, 'shikoyat qabul qilingani haqidagi tasdiq', () =>
+    sendHtml(ctx, complaintAcceptedText(view.id), undefined, msg.message_id),
+  );
+  await closeComplaintPrompt(ctx, clientId, complaintSentPromptText(view.staff_full_name, view.id));
+  return true;
 }
 
 // ───────────────────────────── Xatolar ─────────────────────────────
@@ -750,6 +1046,13 @@ function createClientBot(): Bot {
     await next();
   });
 
+  // Shikoyat drafti bo'lsa — xabar ENG AVVAL shikoyat sifatida qayta ishlanadi (xodimga hech qachon yuborilmaydi).
+  // Buyruqlar draftni jimgina bekor qiladi va odatdagidek ishlaydi.
+  bot.on('message', async (ctx, next) => {
+    if (await interceptComplaint(ctx)) return;
+    await next();
+  });
+
   // ── Buyruqlar ──
   // /start <nom> — xodimning shaxsiy havolasi: darhol shu xodim bilan chat. Oddiy /start — bitta xabar + tanlash.
   bot.command('start', async (ctx) => {
@@ -768,6 +1071,7 @@ function createClientBot(): Bot {
 
   bot.command('menu', (ctx) => sendStart(ctx));
   bot.command('help', (ctx) => sendHelp(ctx));
+  bot.command(['shikoyat', 'complaint'], (ctx) => showComplaintPicker(ctx));
   // Endi ko'rsatilmaydigan (eski) buyruqlar — ishlashda davom etadi
   bot.command('operators', (ctx) => legacyStaffList(ctx, 'operator'));
   bot.command('managers', (ctx) => legacyStaffList(ctx, 'manager'));
@@ -848,23 +1152,27 @@ function createClientBot(): Bot {
     const name = esc(rawName);
 
     if (isStaffAvailable(staff)) {
+      await dropComplaintDraft(ctx, client.tg_user_id);
       await setClientActiveConversation(client.tg_user_id, conv.id);
       client.active_conversation_id = conv.id;
       await answer(ctx, T.convSelected);
       // Saqlab qo'yilgan xabarlar — transkriptdan oldin, u ularni ham ko'rsatadi
       const out = await deliverHeldOnSelect(ctx, client, conv);
       if (out?.unavailable) {
-        await onStaffUnavailable(ctx, client, conv, out.rest);
+        await onStaffUnavailable(ctx, client, conv, out.rest, undefined, out.sent > 0);
         return;
       }
-      await markReadByClient(conv.id);
-      const footer: string[] = [];
-      if (out && out.sent > 0) footer.push(heldSentLine(out.sent, rawName));
-      footer.push(`✍️ Endi xabarlaringiz <b>${name}</b>${dativeSuffix(rawName)} yuboriladi.`);
-      if (out?.undelivered) footer.push(undeliveredNote(rawName));
-      await sendTranscript(ctx, conv, staff, 0, {
-        footer: footer.join('\n'),
-        extraRows: out?.undelivered ? [roleRow()] : undefined,
+      // Saqlangan xabarlar yetkazilgan bo'lsa — transkript eng yaxshi urinish
+      await afterIf(ctx, (out?.sent ?? 0) > 0, 'suhbat transkripti', async () => {
+        await markReadByClient(conv.id);
+        const footer: string[] = [];
+        if (out && out.sent > 0) footer.push(heldSentLine(out.sent, rawName));
+        footer.push(`✍️ Endi xabarlaringiz <b>${name}</b>${dativeSuffix(rawName)} yuboriladi.`);
+        if (out?.undelivered) footer.push(undeliveredNote(rawName));
+        await sendTranscript(ctx, conv, staff, 0, {
+          footer: footer.join('\n'),
+          extraRows: out?.undelivered ? [roleRow()] : undefined,
+        });
       });
       return;
     }
@@ -909,26 +1217,91 @@ function createClientBot(): Bot {
       return answer(ctx, T.staffUnavailable, true);
     }
     const name = staffName(staff);
+    await dropComplaintDraft(ctx, client.tg_user_id);
     await setClientActiveConversation(client.tg_user_id, conv.id);
     client.active_conversation_id = conv.id;
     await answer(ctx, activeChosenToast(name));
 
     const out = await deliverHeldOnSelect(ctx, client, conv);
     if (out?.unavailable) {
-      await onStaffUnavailable(ctx, client, conv, out.rest);
+      await onStaffUnavailable(ctx, client, conv, out.rest, undefined, out.sent > 0);
       return;
     }
-    await markReadByClient(conv.id);
-    const parts: string[] = [];
-    if (out && out.sent > 0) parts.push(heldSentLine(out.sent, name));
-    parts.push(activeChosenText(name));
-    if (out?.undelivered) parts.push(undeliveredNote(name));
-    await sendHtml(
-      ctx,
-      parts.join('\n\n'),
-      out?.undelivered ? markup([roleRow()]) : undefined,
-      ctx.callbackQuery.message?.message_id,
-    );
+    const replyTo = ctx.callbackQuery.message?.message_id;
+    // Saqlangan xabarlar yetkazilgan bo'lsa — tasdiq eng yaxshi urinish
+    await afterIf(ctx, (out?.sent ?? 0) > 0, 'faol suhbat tasdig\'i', async () => {
+      await markReadByClient(conv.id);
+      const parts: string[] = [];
+      if (out && out.sent > 0) parts.push(heldSentLine(out.sent, name));
+      parts.push(activeChosenText(name));
+      if (out?.undelivered) parts.push(undeliveredNote(name));
+      await sendHtml(ctx, parts.join('\n\n'), out?.undelivered ? markup([roleRow()]) : undefined, replyTo);
+    });
+  });
+
+  // ── Shikoyat ──
+  // «✖️ Bekor qilish» (tanlash ro'yxatida ham, shikoyat so'rovida ham)
+  bot.callbackQuery('cmp:x', async (ctx) => {
+    const clientId = clientOf(ctx).tg_user_id;
+    const here = ctx.callbackQuery.message?.message_id;
+    const [draft, marks] = await Promise.all([getActiveDraft(clientId), getComplaintMarks(clientId)]);
+    if (draft && marks.promptMsgId != null && here != null && marks.promptMsgId !== here) {
+      // Eski xabardagi tugma: boshqa xabardagi joriy shikoyatga tegmaymiz. Eski xabar matni ham almashtiriladi —
+      // faqat tugmasi olib tashlansa, undagi QALIN xodim ismi Reply orqali yo'naltirishda (conversationFromNamedStaff)
+      // manzil bo'lib qolardi va keyinroq unga Reply qilingan (shikoyat) matn o'sha xodimga ketib qolishi mumkin edi
+      await answer(ctx, CT.staleCancel);
+      await ctx
+        .editMessageText(CT.stalePrompt, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+        .catch(() => ctx.editMessageReplyMarkup().catch(() => {}));
+      return;
+    }
+    await cancelComplaintDrafts(clientId);
+    await answer(ctx);
+    await editOrSend(ctx, CT.cancelled);
+  });
+
+  // Xodimni tanlash: draft ochiladi, xabar "shikoyatingizni yozing" so'roviga almashadi
+  bot.callbackQuery(/^cmp:(\d{1,15})$/, async (ctx) => {
+    const clientId = clientOf(ctx).tg_user_id;
+    const target = await complaintTarget(clientId, parseId(ctx.match[1]));
+    if (!target) return answer(ctx, CT.notYours, true);
+    const staffId = parseId(ctx.match[1]);
+    const here = ctx.callbackQuery.message?.message_id;
+    // Boshqa xabardagi eski draft (bo'lsa) yopiladi; so'rov xabari id si draftdan OLDIN yoziladi
+    await dropComplaintDraft(ctx, clientId, here);
+    if (here != null) await setComplaintPrompt(clientId, here);
+    await startComplaintDraft(clientId, staffId);
+    await answer(ctx);
+    let shown: number | undefined;
+    try {
+      shown = await editOrSend(ctx, complaintPromptText(complaintStaffName(target.staffFullName)), complaintCancelMarkup());
+    } catch (e) {
+      // So'rov ko'rsatilmagan bo'lishi mumkin (mijoz «shikoyatingizni yozing» ni ko'rmadi) — yoki ko'rsatilgan
+      // (javob kelmay qolgan). Draft «muddati o'tgan» qilinadi: keyingi xabar na shikoyat bo'lib rahbariyatga
+      // (operatorga mo'ljallangan xabar), na xodimga (shikoyat matni) ketadi — hech kimga yuborilmaydi (CT.expired)
+      if (tgErrorCode(e) === 403) await cancelComplaintDrafts(clientId).catch(() => false);
+      else await expireComplaintDrafts(clientId).catch((err) => console.warn('[client] expireComplaintDrafts:', describeError(err)));
+      throw e;
+    }
+    if (shown != null && shown !== here) await setComplaintPrompt(clientId, shown);
+    // Ikki xodim tugmasi bir vaqtda bosilgan bo'lsa: so'rovdagi ism amaldagi (oxirgi) draftnikiga moslanadi —
+    // shikoyat so'rovda ko'rsatilgan odamdan boshqasi ustidan yozilib qolmasin
+    const promptMsg = shown ?? here;
+    await afterSuccess(ctx, "shikoyat so'rovini draftga moslash", async () => {
+      const d = await getActiveDraft(clientId);
+      if (!d || d.staff_id === staffId || promptMsg == null) return;
+      const actual = await complaintTarget(clientId, d.staff_id);
+      if (!actual) return;
+      await ctx.api
+        .editMessageText(ctx.chat!.id, promptMsg, complaintPromptText(complaintStaffName(actual.staffFullName)), {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: complaintCancelMarkup(),
+        })
+        .catch((err) => {
+          if (!isNotModified(err)) throw err;
+        });
+    });
   });
 
   // Noma'lum/eskirgan tugmalar

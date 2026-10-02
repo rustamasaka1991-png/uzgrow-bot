@@ -1,10 +1,13 @@
-// Admin panel (xodimlar boti ichida, faqat ADMIN_IDS): xodim qo'shish / tahrirlash / o'chirish,
-// taklif havolalari, akkauntni uzish, umumiy matnlar va statistika.
-// Holat mashinasi user_state jadvalida saqlanadi; kutilayotgan admin holati xodim xabarlarini
-// mijozga yo'naltirishdan USTUN turadi (admin kiritgan matn hech qachon mijozga ketib qolmaydi).
+// Boshqaruv paneli (xodimlar boti ichida): developer (ADMIN_IDS env), ROP va adminlar (panel_roles, src/roles.ts).
+// Hamma rollar: xodim qo'shish / tahrirlash / bloklash / o'chirish, taklif havolalari, akkauntni uzish, umumiy matnlar,
+// statistika va 📣 mijozlarga xabar (./panel/broadcast.ts).
+// ROP va developer: ⚠️ shikoyatlar (./panel/complaints.ts) ham.
+// Developer: 🛠 developer paneli (./panel/developer.ts). Huquq har bir update da qayta tekshiriladi (ctx.panelRole).
+// Holat mashinasi user_state jadvalida saqlanadi (./panel/state.ts); kutilayotgan panel holati xodim xabarlarini
+// mijozga yo'naltirishdan USTUN turadi (panelga kiritilgan matn hech qachon mijozga ketib qolmaydi).
 import { Composer, InlineKeyboard, InputFile, type NextFunction } from 'grammy';
 import type { Document, Message as TgMessage } from 'grammy/types';
-import { isAdmin } from '../config.js';
+import { countComplaints } from '../complaints.js';
 import { db } from '../db.js';
 import { getWebAppUrl, inviteLink } from '../links.js';
 import {
@@ -26,17 +29,49 @@ import {
   unlinkStaff,
   updateStaff,
 } from '../repo.js';
+import { ROLE_TITLES, can, getPanelRole, type PanelRole } from '../roles.js';
 import { DEFAULT_GREETING, DEFAULT_OFFLINE_NOTE, DEFAULT_WELCOME, SETTING_KEYS, STAFF_NOTICE, fill } from '../texts.js';
 import { FileTooBigError, downloadFile } from '../tg.js';
 import type { Role, Staff } from '../types.js';
 import { dative, dativeSuffix, esc, oneLine, roleIcon, roleLabel, tgErrorCode, tgErrorDescription, truncate } from '../util.js';
+import { requirePerm } from './panel/access.js';
+import { broadcastComposer, handleBroadcastInput, startBroadcast } from './panel/broadcast.js';
+import { complaintsComposer } from './panel/complaints.js';
+import { devHomeView, developerComposer, handleDevAddInput } from './panel/developer.js';
+import {
+  EDIT_FIELDS,
+  casState,
+  enterState,
+  finishState,
+  isSettingName,
+  loadState,
+  loadStateRow,
+  statePerm,
+  takeState,
+  takeStateRow,
+  withoutGroup,
+  type AddStage,
+  type AddState,
+  type AdminState,
+  type Draft,
+  type EditField,
+  type EditState,
+  type InputState,
+  type SettingName,
+  type SettingState,
+  type StateRow,
+  type TextField,
+} from './panel/state.js';
 import { clientNameOf, ownActiveConversation, ownConversationView, resolveReplyConversation } from './staff/conv.js';
 import {
-  ADMIN_ONLY_TEXT,
+  BLOCK_NOTICE,
   BTN,
   CAPTION_LIMIT,
+  NO_ACCESS_TEXT,
+  PANEL_CALLBACK_RE,
   STALE_BUTTON_TEXT,
   TEXT_LIMIT,
+  afterSuccess,
   callbackMessage,
   clientLinkOf,
   fmtNum,
@@ -53,63 +88,10 @@ import {
   type View,
 } from './staff/ui.js';
 
-// ───────────────────────────── Holat (state) turlari ─────────────────────────────
-
-type AddStage = 'role' | 'name' | 'position' | 'description' | 'greeting' | 'photo';
-const ADD_STAGES: readonly AddStage[] = ['role', 'name', 'position', 'description', 'greeting', 'photo'];
 const STAGE_NO: Record<AddStage, number> = { role: 1, name: 2, position: 3, description: 4, greeting: 5, photo: 6 };
 
-type TextField = 'full_name' | 'position' | 'description' | 'greeting';
-/** `link_code` — mijozlar uchun shaxsiy havola nomi (t.me/<mijoz_boti>?start=<nom>). */
-type EditField = TextField | 'photo' | 'link_code';
-// Tartib muhim: stateTag() indeksni ishlatadi — yangi maydonlar faqat oxiriga qo'shiladi
-const EDIT_FIELDS: readonly EditField[] = ['full_name', 'position', 'description', 'greeting', 'photo', 'link_code'];
-
-type SettingName = 'welcome' | 'greeting' | 'offline';
-
-interface Draft {
-  role?: Role;
-  full_name?: string;
-  position?: string;
-  description?: string;
-  /** null — standart avto-javob */
-  greeting?: string | null;
-}
-
-interface InputStateBase {
-  /** Oxirgi so'rov xabari (keyingi qadamda uning tugmalari olib tashlanadi) */
-  promptMsgId?: number;
-  /**
-   * Noto'g'ri turdagi albom (media group) kelganda so'rov faqat BIR marta qayta ko'rsatiladi: albomning qolgan
-   * elementlari shu belgi orqali jimgina e'tiborsiz qoldiriladi. Keyingi albom bo'lmagan xabar uni o'chiradi.
-   */
-  ignoreGroup?: string;
-}
-interface AddState extends InputStateBase {
-  step: 'add';
-  stage: AddStage;
-  draft: Draft;
-}
-interface EditState extends InputStateBase {
-  step: 'edit';
-  staffId: number;
-  field: EditField;
-}
-interface SettingState extends InputStateBase {
-  step: 'setting';
-  key: SettingName;
-}
-/**
- * Rasm albom (media group) bo'lib kelganda: birinchi rasm qabul qilingach, albomning qolgan rasmlari
- * ketma-ket kelsa ham mijozga yo'naltirilib ketmasligi uchun qisqa "iz". Boshqa har qanday xabar uni o'chiradi.
- */
-interface GroupState {
-  step: 'group';
-  mediaGroupId: string;
-  promptMsgId?: number;
-}
-type InputState = AddState | EditState | SettingState;
-type AdminState = InputState | GroupState;
+/** Shu fayldagi (xodim va matnlar) kiritma holatlari; ommaviy xabar va developer holatlari — ./panel/*. */
+type CoreInputState = AddState | EditState | SettingState;
 
 // ───────────────────────────── Matnlar va qoidalar ─────────────────────────────
 
@@ -139,10 +121,6 @@ const SETTINGS: Record<SettingName, { key: string; title: string; about: string;
     def: DEFAULT_OFFLINE_NOTE,
   },
 };
-
-function isSettingName(s: string | undefined): s is SettingName {
-  return s === 'welcome' || s === 'greeting' || s === 'offline';
-}
 
 const RULES: Record<TextField, { min: number; max: number; multiline: boolean; hint: string }> = {
   full_name: { min: 2, max: 64, multiline: false, hint: "Ism 2 dan 64 belgigacha bo'lishi kerak." },
@@ -180,11 +158,6 @@ const CANCEL_KB = () => new InlineKeyboard().text('✖️ Bekor qilish', 'adm:ca
 const DROPPED_TEXT = 'ℹ️ Tugallanmagan admin amali bekor qilindi.';
 const EXPIRED_TEXT = "ℹ️ Tugallanmagan admin amali muddati o'tgani uchun bekor qilindi.";
 
-/**
- * Admin kiritmasini kutish muddati (har bir qadam uni yangilaydi). Undan keyin yozilgan matn hech qachon
- * xodim ma'lumoti yoki umumiy matn sifatida saqlanib ketmaydi.
- */
-const INPUT_TTL_SEC = 15 * 60;
 /**
  * Admin ham xodim bo'lsa va aktiv suhbati bo'lsa: so'rov shundan eskiroq bo'lsa, Reply'siz yozilgan xabar
  * admin kiritmasimi yoki mijozga javobmi — taxmin qilinmaydi, so'raladi.
@@ -311,106 +284,7 @@ function fit(build: (a: number, b: number) => string, sizes: Array<[number, numb
   return null;
 }
 
-// ───────────────────────────── State saqlash (atomik) ─────────────────────────────
-
-function parseState(raw: unknown): AdminState | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-  if (r.promptMsgId !== undefined && !Number.isSafeInteger(r.promptMsgId)) return null;
-  if (r.ignoreGroup !== undefined && (typeof r.ignoreGroup !== 'string' || !r.ignoreGroup)) return null;
-  switch (r.step) {
-    case 'add': {
-      if (!ADD_STAGES.includes(r.stage as AddStage)) return null;
-      if (!r.draft || typeof r.draft !== 'object' || Array.isArray(r.draft)) return null;
-      const d = r.draft as Record<string, unknown>;
-      if (d.role !== undefined && d.role !== 'operator' && d.role !== 'manager') return null;
-      for (const k of ['full_name', 'position', 'description']) {
-        if (d[k] !== undefined && typeof d[k] !== 'string') return null;
-      }
-      if (d.greeting !== undefined && d.greeting !== null && typeof d.greeting !== 'string') return null;
-      return raw as AddState;
-    }
-    case 'edit':
-      if (!Number.isSafeInteger(r.staffId) || !EDIT_FIELDS.includes(r.field as EditField)) return null;
-      return raw as EditState;
-    case 'setting':
-      return isSettingName(r.key as string) ? (raw as SettingState) : null;
-    case 'group':
-      return typeof r.mediaGroupId === 'string' && r.mediaGroupId ? (raw as GroupState) : null;
-    default:
-      return null;
-  }
-}
-
-/** Amalni yakunlash: holat o'chiriladi (albom bo'lsa — uning qolgan qismi uchun iz qoldiriladi). */
-async function finishState(userId: number, st: InputState, msg: TgMessage | null): Promise<boolean> {
-  const next: GroupState | null = msg?.media_group_id ? { step: 'group', mediaGroupId: msg.media_group_id } : null;
-  return casState(userId, st, next);
-}
-
-interface StateRow {
-  st: AdminState;
-  /** Oxirgi yangilanishdan beri o'tgan vaqt (soniya) */
-  ageSec: number;
-  /** INPUT_TTL_SEC dan yangi */
-  fresh: boolean;
-}
-
-/** Holat + uning yoshi (muddati o'tgan holat ham qaytadi — chaqiruvchi uni bekor qiladi). */
-async function loadStateRow(userId: number): Promise<StateRow | null> {
-  const rows = await db()<{ state: unknown; age: number }[]>`
-    select state, extract(epoch from (now() - updated_at))::float8 as age
-    from user_state where bot = 'staff' and tg_user_id = ${userId}`;
-  const r = rows[0];
-  if (!r) return null;
-  const st = parseState(r.state);
-  if (!st) {
-    await clearState('staff', userId);
-    return null;
-  }
-  const ageSec = Number(r.age) || 0;
-  return { st, ageSec, fresh: ageSec < INPUT_TTL_SEC };
-}
-
-/** Amaldagi (muddati o'tmagan) holat. */
-async function loadState(userId: number): Promise<AdminState | null> {
-  const row = await loadStateRow(userId);
-  return row?.fresh ? row.st : null;
-}
-
-/**
- * Compare-and-swap: holat hali ham `expected` bo'lsa, uni `next` ga almashtiradi (null — o'chiradi).
- * Bir vaqtda kelgan ikki xabar (masalan, albomdagi 2 ta rasm) bir amalni ikki marta bajarmasligi uchun.
- */
-async function casState(userId: number, expected: AdminState, next: AdminState | null): Promise<boolean> {
-  const sql = db();
-  const rows = next
-    ? await sql`
-        update user_state set state = ${sql.json(next as never)}, updated_at = now()
-        where bot = 'staff' and tg_user_id = ${userId} and state = ${sql.json(expected as never)}
-        returning 1 as ok`
-    : await sql`
-        delete from user_state
-        where bot = 'staff' and tg_user_id = ${userId} and state = ${sql.json(expected as never)}
-        returning 1 as ok`;
-  return rows.length > 0;
-}
-
-/** Holatni o'chirib, o'chirilgan holatni (muddati o'tgan bo'lsa ham) va uning yangiligini qaytaradi. */
-async function takeStateRow(userId: number): Promise<{ st: AdminState; fresh: boolean } | null> {
-  const rows = await db()<{ state: unknown; fresh: boolean }[]>`
-    delete from user_state where bot = 'staff' and tg_user_id = ${userId}
-    returning state, (extract(epoch from (now() - updated_at)) < ${INPUT_TTL_SEC}) as fresh`;
-  const r = rows[0];
-  const st = r ? parseState(r.state) : null;
-  return st ? { st, fresh: !!r!.fresh } : null;
-}
-
-/** Holatni o'chirib, o'chirilgan (va hali eskirmagan) holatni qaytaradi. */
-async function takeState(userId: number): Promise<AdminState | null> {
-  const r = await takeStateRow(userId);
-  return r?.fresh ? r.st : null;
-}
+// ───────────────────────────── Holat ─────────────────────────────
 
 /**
  * Tugallanmagan admin amalini bekor qilish (/start, /cancel): holat o'chiriladi va so'rov xabaridagi tugmalar
@@ -425,24 +299,28 @@ export async function dropAdminState(ctx: StaffContext): Promise<boolean> {
   return r.fresh;
 }
 
-/** Yangi holatni saqlab, so'rov xabarini ko'rsatadi va uning id sini holatga yozadi. */
-async function enterState(ctx: StaffContext, st: AdminState, view: View, mode: 'edit' | 'new'): Promise<void> {
-  const uid = ctx.from!.id;
-  await setState('staff', uid, st);
-  const msgId = await render(ctx, view, mode);
-  await casState(uid, st, { ...st, promptMsgId: msgId });
-}
-
 // ───────────────────────────── Ko'rinishlar ─────────────────────────────
 
-async function homeView(notice?: string): Promise<View> {
-  const [all, url] = await Promise.all([listAllStaff(), getWebAppUrl()]);
+async function homeView(role: PanelRole, notice?: string): Promise<View> {
+  const complaints = can(role, 'complaints');
+  const [all, url, newComplaints] = await Promise.all([
+    listAllStaff(),
+    getWebAppUrl(),
+    complaints ? countComplaints('new') : Promise.resolve(0),
+  ]);
   const ops = all.filter((s) => s.role === 'operator').length;
   const unlinked = all.filter((s) => s.tg_user_id == null).length;
+  const blocked = all.filter((s) => !s.is_active).length;
   const lines: string[] = [];
   if (notice) lines.push(notice, '');
-  lines.push('⚙️ <b>Admin panel</b>', '', `👥 Xodimlar: <b>${all.length}</b> (👨‍💻 ${ops} · 👔 ${all.length - ops})`);
+  lines.push(
+    `⚙️ <b>Admin panel</b> · ${ROLE_TITLES[role]}`,
+    '',
+    `👥 Xodimlar: <b>${all.length}</b> (👨‍💻 ${ops} · 👔 ${all.length - ops})`,
+  );
   if (unlinked) lines.push(`⏳ Akkaunti ulanmaganlar: ${unlinked}`);
+  if (blocked) lines.push(`🚫 Bloklanganlar: ${blocked}`);
+  if (complaints && newComplaints) lines.push(`⚠️ Yangi shikoyatlar: <b>${newComplaints}</b>`);
   lines.push('', "Kerakli bo'limni tanlang 👇");
   const kb = new InlineKeyboard()
     .text("➕ Xodim qo'shish", 'adm:add')
@@ -455,6 +333,12 @@ async function homeView(notice?: string): Promise<View> {
     .row()
     .text('🕐 Oflayn izohi', 'adm:set:offline')
     .row();
+  if (can(role, 'broadcast') || complaints) {
+    if (can(role, 'broadcast')) kb.text('📣 Mijozlarga xabar', 'adm:bc');
+    if (complaints) kb.text(`⚠️ Shikoyatlar (${newComplaints})`, 'cmpl:new:0');
+    kb.row();
+  }
+  if (can(role, 'developer')) kb.text('🛠 Developer panel', 'dev:home').row();
   if (url) kb.webApp('📱 Mini App da boshqarish', url);
   return { text: lines.join('\n'), keyboard: kb };
 }
@@ -462,7 +346,7 @@ async function homeView(notice?: string): Promise<View> {
 const LIST_PAGE_SIZE = 20;
 
 function staffStateIcon(s: Pick<Staff, 'tg_user_id' | 'is_active'>): string {
-  return s.tg_user_id != null ? (s.is_active ? '🟢' : '⛔') : '⏳';
+  return s.tg_user_id != null ? (s.is_active ? '🟢' : '🚫') : '⏳';
 }
 
 async function listView(page: number, notice?: string): Promise<View> {
@@ -476,7 +360,7 @@ async function listView(page: number, notice?: string): Promise<View> {
     `👥 <b>Xodimlar</b> (${all.length})`,
     `👨‍💻 Operatorlar: ${ops} · 👔 Menejerlar: ${all.length - ops}`,
     '',
-    "🟢 faol · ⛔ o'chirilgan · ⏳ akkaunt ulanmagan",
+    '🟢 faol · 🚫 bloklangan · ⏳ akkaunt ulanmagan',
   );
   if (all.some((s) => s.bot_blocked && s.tg_user_id != null)) lines.push("⚠️ — xodimlar botini to'xtatgan (xabarlar unga yetib bormayapti)");
   if (!all.length) lines.push('', "Hozircha xodimlar yo'q. «➕ Qo'shish» tugmasini bosib, birinchi xodimni qo'shing.");
@@ -513,7 +397,7 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
   const clientLink = await clientLinkOf(s);
   const clientLinkLine = clientLink
     ? `🔗 Mijozlar uchun havola: ${esc(clientLink)}` +
-      (!linked ? ' (akkaunt ulangandan keyin ishlaydi)' : !s.is_active ? ' (xodim faollashtirilgach ishlaydi)' : '')
+      (!linked ? ' (akkaunt ulangandan keyin ishlaydi)' : !s.is_active ? ' (xodim blokdan chiqarilgach ishlaydi)' : '')
     : `🔗 Mijozlar uchun havola nomi: <code>${esc(s.link_code ?? `staff_${s.id}`)}</code>`;
 
   const build = (descMax: number, greetMax: number): string => {
@@ -524,7 +408,7 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
       `🏷 Rol: <b>${roleLabel(s.role)}</b>`,
       `💼 Lavozim: ${s.position ? esc(s.position) : '—'}`,
       `📝 Tavsif: ${s.description ? esc(truncate(s.description, descMax)) : '—'}`,
-      `📶 Holat: ${s.is_active ? '✅ faol' : "⛔ o'chirib qo'yilgan"} · ${s.is_online ? '🟢 onlayn' : '⚪️ oflayn'}`,
+      `📶 Holat: ${s.is_active ? '✅ faol' : '🚫 bloklangan'} · ${s.is_online ? '🟢 onlayn' : '⚪️ oflayn'}`,
     );
     const account = linked
       ? s.tg_username
@@ -556,7 +440,7 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
       lines.push('', "📨 Taklif havolasi yo'q — «🔗 Yangi havola» tugmasini bosing.");
     }
     if (linked && !s.is_active) {
-      lines.push('', "ℹ️ Xodim o'chirib qo'yilgan: mijozlar uni menyuda ko'rmaydi va unga yoza olmaydi, u ham mijozlarga yoza olmaydi.");
+      lines.push('', "ℹ️ Xodim bloklangan: mijozlar uni menyuda ko'rmaydi va unga yoza olmaydi, u ham mijozlarga yoza olmaydi.");
     }
     return lines.join('\n');
   };
@@ -575,7 +459,7 @@ async function cardView(s: Staff, notice?: string): Promise<View> {
     .text('✏️ Havola nomi', `adm:e:${id}:link_code`);
   if (clientLink) kb.url('📤 Mijozlarga ulashish', shareUrl(clientLink));
   kb.row()
-    .text(s.is_active ? "⛔ O'chirib qo'yish" : '✅ Faollashtirish', `adm:act:${id}`);
+    .text(s.is_active ? '🚫 Bloklash' : '✅ Blokdan chiqarish', `adm:act:${id}`);
   if (!linked) kb.text('🔗 Yangi havola', `adm:inv:${id}`);
   kb.row();
   if (link && link.startsWith('https://')) {
@@ -745,7 +629,7 @@ async function settingView(name: SettingName, error?: string): Promise<View> {
 /** Statistika sahifasidagi xodimlar soni (matn 4096 belgidan oshmasligi uchun). */
 const STATS_PAGE_SIZE = 30;
 
-async function statsView(page: number): Promise<View> {
+async function statsView(page: number, role: PanelRole): Promise<View> {
   const sql = db();
   const perPage = (p: number) => sql<
     {
@@ -772,7 +656,13 @@ async function statsView(page: number): Promise<View> {
     limit ${STATS_PAGE_SIZE} offset ${p * STATS_PAGE_SIZE}`;
 
   let p = Math.max(0, Math.trunc(page) || 0);
-  const [st, first] = await Promise.all([getStats(), perPage(p)]);
+  const complaints = can(role, 'complaints');
+  const [st, first, cNew, cAll] = await Promise.all([
+    getStats(),
+    perPage(p),
+    complaints ? countComplaints('new') : Promise.resolve(0),
+    complaints ? countComplaints('all') : Promise.resolve(0),
+  ]);
   let per = first;
   // Sahifa endi mavjud emas (xodimlar o'chirilgan) — oxirgi sahifani ko'rsatamiz
   if (!per.length && p > 0) {
@@ -791,11 +681,12 @@ async function statsView(page: number): Promise<View> {
     `✉️ Xabarlar: <b>${fmtNum(st.messages)}</b> (so'nggi 24 soatda +${fmtNum(st.messages_today)})`,
     `🧑‍💼 Xodimlar: <b>${fmtNum(st.staff_total)}</b> (akkaunti ulangan: ${fmtNum(st.staff_linked)})`,
   ];
+  if (complaints) lines.push(`⚠️ Shikoyatlar: ${fmtNum(cNew)} yangi / ${fmtNum(cAll)} jami`);
   if (per.length) {
     const range = pages > 1 ? ` — ${fmtNum(p * STATS_PAGE_SIZE + 1)}–${fmtNum(p * STATS_PAGE_SIZE + per.length)} / ${fmtNum(total)}` : '';
     lines.push('', `<b>Xodimlar bo'yicha</b> (chatlar · o'qilmagan)${range}:`);
     for (const s of per) {
-      const icon = s.tg_user_id != null ? (s.is_active ? (s.is_online ? '🟢' : '⚪️') : '⛔') : '⏳';
+      const icon = s.tg_user_id != null ? (s.is_active ? (s.is_online ? '🟢' : '⚪️') : '🚫') : '⏳';
       const unread = s.unread ? ` · 🔴 ${fmtNum(s.unread)}` : '';
       lines.push(`${icon} ${roleIcon(s.role)} ${esc(oneLine(s.full_name, 32))} — ${fmtNum(s.chats)}${unread}`);
     }
@@ -815,11 +706,14 @@ async function statsView(page: number): Promise<View> {
 
 export const adminComposer = new Composer<StaffContext>();
 
-// Admin bo'lmaganlar uchun admin kirish nuqtalari yopiq
+// Panel roli bo'lmaganlar (oddiy xodimlar, huquqi olib tashlanganlar) uchun panel kirish nuqtalari yopiq
 const guest = adminComposer.filter((ctx) => !ctx.admin);
-guest.command('admin', (ctx) => sendHtml(ctx, ADMIN_ONLY_TEXT));
-guest.hears(BTN.admin, (ctx) => sendHtml(ctx, ADMIN_ONLY_TEXT));
-guest.callbackQuery(/^adm:/, (ctx) => ctx.answerCallbackQuery({ text: ADMIN_ONLY_TEXT, show_alert: true }));
+// Huquqi olib tashlangan foydalanuvchining tugallanmagan panel amali bekor qilinadi — xabar odatdagidek
+// (xodim xabari sifatida) qayta ishlanadi
+guest.on('message', dropForbiddenState);
+guest.command('admin', denyEntry);
+guest.hears(BTN.admin, denyEntry);
+guest.callbackQuery(PANEL_CALLBACK_RE, (ctx) => ctx.answerCallbackQuery({ text: NO_ACCESS_TEXT, show_alert: true }));
 
 const adminOnly = adminComposer.filter((ctx) => ctx.admin);
 // 1) Kutilayotgan holat bo'lsa — xabarni shu yerda "yeb qo'yamiz" (mijozga ketmaydi)
@@ -830,9 +724,31 @@ adminOnly.callbackQuery(/^(act|open):/, dropStateOnChatSwitch);
 adminOnly.command('admin', (ctx) => showHome(ctx, 'new'));
 adminOnly.hears(BTN.admin, (ctx) => showHome(ctx, 'new'));
 adminOnly.callbackQuery(/^adm:/, onAdminCallback);
+// 4) ROP/developer: shikoyatlar va ommaviy xabar; developer: developer paneli (har biri o'z huquqini tekshiradi)
+adminOnly.use(complaintsComposer);
+adminOnly.use(broadcastComposer);
+adminOnly.use(developerComposer);
 
 async function showHome(ctx: StaffContext, mode: 'edit' | 'new', notice?: string): Promise<void> {
-  await render(ctx, await homeView(notice), mode);
+  await render(ctx, await homeView(ctx.panelRole!, notice), mode);
+}
+
+/** Panel roli yo'q foydalanuvchi /admin yoki «⚙️ Admin panel» ni bosdi (eski klaviatura) — klaviatura yangilanadi. */
+async function denyEntry(ctx: StaffContext): Promise<void> {
+  await sendHtml(ctx, NO_ACCESS_TEXT, { markup: mainKeyboard(ctx.staff, false) });
+}
+
+const FORBIDDEN_DROPPED_TEXT = "ℹ️ Tugallanmagan admin amali bekor qilindi — endi bu amal uchun ruxsatingiz yo'q.";
+
+/** Panel huquqi yo'q (yoki yetmaydigan) foydalanuvchining holati: bekor qilinadi, xabar keyingi handlerlarga o'tadi. */
+async function dropForbiddenState(ctx: StaffContext, next: NextFunction): Promise<void> {
+  const uid = ctx.from!.id;
+  const row = await loadStateRow(uid);
+  if (row && (await casState(uid, row.st, null)) && row.st.step !== 'group' && row.fresh) {
+    await stripKeyboard(ctx, row.st.promptMsgId);
+    await sendHtml(ctx, FORBIDDEN_DROPPED_TEXT);
+  }
+  return next();
 }
 
 async function stale(ctx: StaffContext): Promise<void> {
@@ -859,6 +775,15 @@ async function onPendingInput(ctx: StaffContext, next: NextFunction): Promise<vo
     // Qabul qilingan albomning qolgan rasmlari — jimgina e'tiborsiz
     if (msg.media_group_id && msg.media_group_id === st.mediaGroupId) return;
     await casState(uid, st, null);
+    return next();
+  }
+
+  // Rol o'zgargan (masalan, ROP → admin): bu amalga endi ruxsat yo'q — bekor qilinadi, xabar odatdagidek qayta ishlanadi
+  if (!can(ctx.panelRole, statePerm(st))) {
+    if (await casState(uid, st, null)) {
+      await stripKeyboard(ctx, st.promptMsgId);
+      await sendHtml(ctx, FORBIDDEN_DROPPED_TEXT);
+    }
     return next();
   }
 
@@ -896,6 +821,11 @@ function handleInput(ctx: StaffContext, msg: TgMessage, st: InputState): Promise
       return handleEditInput(ctx, msg, st);
     case 'setting':
       return handleSettingInput(ctx, msg, st);
+    case 'broadcast':
+    case 'broadcast_confirm':
+      return handleBroadcastInput(ctx, msg, st);
+    case 'dev_add':
+      return handleDevAddInput(ctx, msg, st);
   }
 }
 
@@ -908,6 +838,11 @@ function stateLabel(st: InputState): string {
       return st.field === 'link_code' ? '✏️ xodim havola nomi' : `✏️ xodim ${FIELD_TITLES[st.field]}i`;
     case 'setting':
       return SETTINGS[st.key].title;
+    case 'broadcast':
+    case 'broadcast_confirm':
+      return '📣 mijozlarga xabar';
+    case 'dev_add':
+      return st.role === 'rop' ? "➕ ROP qo'shish" : "➕ admin qo'shish";
   }
 }
 
@@ -920,6 +855,12 @@ function stateTag(st: InputState): string {
       return `e${st.staffId}.${EDIT_FIELDS.indexOf(st.field)}`;
     case 'setting':
       return `s${st.key}`;
+    case 'broadcast':
+      return 'b';
+    case 'broadcast_confirm':
+      return `bc${st.srcMsgId}`;
+    case 'dev_add':
+      return `d${st.role}`;
   }
 }
 
@@ -974,6 +915,13 @@ async function onSaveChoice(ctx: StaffContext, tag: string | undefined): Promise
     if (prompt) await stripKeyboard(ctx, prompt.message_id);
     return;
   }
+  // Rol o'zgargan (masalan, ROP → admin): bu amalga endi ruxsat yo'q — holat bekor qilinadi
+  if (!can(ctx.panelRole, statePerm(st))) {
+    if (await casState(uid, st, null)) await stripKeyboard(ctx, st.promptMsgId);
+    if (prompt) await stripKeyboard(ctx, prompt.message_id);
+    await ctx.answerCallbackQuery({ text: NO_ACCESS_TEXT, show_alert: true });
+    return;
+  }
   await ctx.answerCallbackQuery();
   await stripKeyboard(ctx, prompt!.message_id);
   await handleInput(ctx, orig, st);
@@ -994,6 +942,9 @@ async function onAdminCallback(ctx: StaffContext): Promise<void> {
   const data = ctx.callbackQuery?.data ?? '';
   const [, action = '', a1, a2] = data.split(':');
   const uid = ctx.from!.id;
+
+  // ROP/developer bo'limi: huquq yetmasa — kutilayotgan kiritmaga tegilmaydi
+  if (action === 'bc' && !(await requirePerm(ctx, 'broadcast'))) return;
 
   // Oddiy navigatsiya tugmalari kutilayotgan kiritishni bekor qiladi
   // (aks holda keyingi xabar kutilmaganda admin kiritmasi bo'lib qolishi mumkin).
@@ -1045,8 +996,10 @@ async function onAdminCallback(ctx: StaffContext): Promise<void> {
       return doResetSetting(ctx, a1);
     case 'stats':
       await ctx.answerCallbackQuery();
-      await render(ctx, await statsView(Number(a1 ?? 0) || 0));
+      await render(ctx, await statsView(Number(a1 ?? 0) || 0, ctx.panelRole!));
       return;
+    case 'bc':
+      return startBroadcast(ctx);
     default:
       return stale(ctx);
   }
@@ -1064,9 +1017,11 @@ async function loadStaffOr(ctx: StaffContext, id: number | null): Promise<Staff 
 async function notifyUser(ctx: StaffContext, tgUserId: number | null, text: string, keyboard = false): Promise<void> {
   if (!tgUserId) return;
   try {
+    // Xodim profili uzildi/o'chirildi: klaviatura — panel roli bo'lsa admin klaviaturasi, aks holda olib tashlanadi
+    const panel = keyboard ? !!(await getPanelRole(tgUserId).catch(() => null)) : false;
     await ctx.api.sendMessage(tgUserId, text, {
       parse_mode: 'HTML',
-      ...(keyboard ? { reply_markup: mainKeyboard(null, isAdmin(tgUserId)) } : {}),
+      ...(keyboard ? { reply_markup: mainKeyboard(null, panel) } : {}),
     });
   } catch (e) {
     console.warn(`[staff/admin] ${tgUserId} ga xabar yuborilmadi:`, tgErrorDescription(e));
@@ -1205,7 +1160,16 @@ async function finishAdd(
     "✅ <b>Yangi xodim qo'shildi!</b>\n" +
     "📨 Taklif havolasini xodimga yuboring — u havolani bosib, Telegram akkauntini ulaydi. Shundan so'ng mijozlar uni menyuda ko'radi.\n" +
     "🔗 Mijozlar uchun havolasi ham tayyor (quyida) — mijoz shu havola orqali kirsa, darhol shu xodim bilan chat boshlanadi.";
-  await render(ctx, await cardView(s, notice), viaCallback ? 'edit' : 'new');
+  // Xodim allaqachon yaratilgan: karta chiqmasa ham «qayta urinib ko'ring» ko'rsatilmaydi (admin uni ikkinchi marta
+  // qo'shib yubormasin) — o'rniga qisqa tasdiq va karta tugmasi
+  await afterSuccess(
+    'yangi xodim kartasi',
+    async () => render(ctx, await cardView(s, notice), viaCallback ? 'edit' : 'new'),
+    () =>
+      sendHtml(ctx, `✅ <b>${esc(s.full_name)}</b> (${roleLabel(s.role)}) qo'shildi.`, {
+        markup: new InlineKeyboard().text('🧑‍💼 Xodim kartasi', `adm:s:${s.id}`),
+      }),
+  );
 }
 
 /**
@@ -1286,26 +1250,18 @@ async function handleAddInput(ctx: StaffContext, msg: TgMessage, st: AddState): 
   }
 }
 
-/** Albom belgisi olib tashlangan holat. */
-function withoutGroup<T extends InputState>(st: T): T {
-  if (st.ignoreGroup === undefined) return st;
-  const copy = { ...st };
-  delete copy.ignoreGroup;
-  return copy;
-}
-
 /**
  * Noto'g'ri kiritishda: qoidani eslatib, so'rovni qayta ko'rsatish.
  * Albom (media group) bo'lsa — so'rov faqat bir marta: xabar yuborishdan OLDIN albom CAS bilan "egallanadi",
  * shuning uchun bir vaqtda kelgan elementlardan faqat bittasi so'rov yuboradi, qolganlari jimgina tugaydi.
  */
-async function reprompt(ctx: StaffContext, st: InputState, error: string, msg: TgMessage | null): Promise<void> {
+async function reprompt(ctx: StaffContext, st: CoreInputState, error: string, msg: TgMessage | null): Promise<void> {
   const uid = ctx.from!.id;
-  let cur: InputState = st;
+  let cur: CoreInputState = st;
   const mgid = msg?.media_group_id;
   if (mgid) {
     if (cur.ignoreGroup !== mgid) {
-      const claimed: InputState = { ...cur, ignoreGroup: mgid };
+      const claimed: CoreInputState = { ...cur, ignoreGroup: mgid };
       if (!(await casState(uid, cur, claimed))) return;
       cur = claimed;
     }
@@ -1358,7 +1314,12 @@ async function showUpdated(ctx: StaffContext, s: Staff | null, notice: string): 
     });
     return;
   }
-  await render(ctx, await cardView(s, notice), 'new');
+  // O'zgarish allaqachon saqlangan — karta eng yaxshi urinish
+  await afterSuccess(
+    'yangilangan xodim kartasi',
+    async () => render(ctx, await cardView(s, notice), 'new'),
+    () => sendHtml(ctx, notice, { markup: new InlineKeyboard().text('🧑‍💼 Xodim kartasi', `adm:s:${s.id}`) }),
+  );
 }
 
 async function handleEditInput(ctx: StaffContext, msg: TgMessage, st: EditState): Promise<void> {
@@ -1461,7 +1422,7 @@ async function handleLinkCodeInput(ctx: StaffContext, msg: TgMessage, st: EditSt
  * Holat allaqachon (CAS bilan) olib tashlangandan keyingi yozuv. Baza xatosida holat tiklanadi va so'rov
  * qayta ko'rsatiladi — admin kiritgan qiymat qayta yuborilishi bilan saqlanadi. Xatoda `undefined`.
  */
-async function saveOrRestore<R>(ctx: StaffContext, st: InputState, write: () => Promise<R>): Promise<R | undefined> {
+async function saveOrRestore<R>(ctx: StaffContext, st: CoreInputState, write: () => Promise<R>): Promise<R | undefined> {
   try {
     return await write();
   } catch (e) {
@@ -1490,7 +1451,8 @@ async function toggleRole(ctx: StaffContext, id: number | null): Promise<void> {
     return;
   }
   await ctx.answerCallbackQuery({ text: `🔄 Yangi rol: ${roleLabel(role)}` });
-  await render(ctx, await cardView(u));
+  // Rol allaqachon almashgan: «qayta urinib ko'ring» bo'yicha qayta bosish uni ortga qaytarardi
+  await afterSuccess('rol almashgandan keyingi karta', async () => render(ctx, await cardView(u)));
 }
 
 async function toggleActive(ctx: StaffContext, id: number | null): Promise<void> {
@@ -1501,11 +1463,12 @@ async function toggleActive(ctx: StaffContext, id: number | null): Promise<void>
     await loadStaffOr(ctx, null);
     return;
   }
-  await ctx.answerCallbackQuery({ text: u.is_active ? '✅ Faollashtirildi' : "⛔ O'chirib qo'yildi" });
+  await ctx.answerCallbackQuery({ text: u.is_active ? '✅ Blokdan chiqarildi' : '🚫 Bloklandi' });
   if (u.tg_user_id && u.tg_user_id !== ctx.from!.id) {
-    await notifyUser(ctx, u.tg_user_id, u.is_active ? STAFF_NOTICE.activated : STAFF_NOTICE.deactivated);
+    await notifyUser(ctx, u.tg_user_id, u.is_active ? BLOCK_NOTICE.unblocked : BLOCK_NOTICE.blocked);
   }
-  await render(ctx, await cardView(u));
+  // Bloklash allaqachon bajarilgan: «qayta urinib ko'ring» bo'yicha qayta bosish uni ortga qaytarardi
+  await afterSuccess('bloklashdan keyingi karta', async () => render(ctx, await cardView(u)));
 }
 
 async function newInvite(ctx: StaffContext, id: number | null): Promise<void> {
@@ -1522,7 +1485,9 @@ async function newInvite(ctx: StaffContext, id: number | null): Promise<void> {
     return;
   }
   await ctx.answerCallbackQuery({ text: '🔗 Yangi havola yaratildi' });
-  await render(ctx, await cardView(u, '🔗 Yangi taklif havolasi yaratildi. Eski havola endi ishlamaydi.'));
+  await afterSuccess('yangi taklif havolasi kartasi', async () =>
+    render(ctx, await cardView(u, '🔗 Yangi taklif havolasi yaratildi. Eski havola endi ishlamaydi.')),
+  );
 }
 
 // ── Akkauntni uzish ──
@@ -1563,7 +1528,9 @@ async function doUnlink(ctx: StaffContext, id: number | null): Promise<void> {
   await ctx.answerCallbackQuery({ text: '🔌 Akkaunt uzildi' });
   await notifyUser(ctx, oldTg, STAFF_NOTICE.unlinked(s.full_name), true);
   if (oldTg === ctx.from!.id) ctx.staff = null;
-  await render(ctx, await cardView(u, '🔌 Akkaunt uzildi. Qayta ulash uchun quyidagi yangi havolani yuboring.'));
+  await afterSuccess('akkaunt uzilgandan keyingi karta', async () =>
+    render(ctx, await cardView(u, '🔌 Akkaunt uzildi. Qayta ulash uchun quyidagi yangi havolani yuboring.')),
+  );
 }
 
 // ── O'chirish ──
@@ -1595,9 +1562,11 @@ async function doDelete(ctx: StaffContext, id: number | null): Promise<void> {
     await notifyUser(ctx, oldTg, STAFF_NOTICE.deleted(s.full_name), true);
     if (oldTg === ctx.from!.id) ctx.staff = null;
   }
-  await render(
-    ctx,
-    await listView(0, ok ? `🗑 <b>${esc(s.full_name)}</b> o'chirildi. Suhbatlar tarixi bazada saqlanib qoladi.` : undefined),
+  await afterSuccess("o'chirilgandan keyingi ro'yxat", async () =>
+    render(
+      ctx,
+      await listView(0, ok ? `🗑 <b>${esc(s.full_name)}</b> o'chirildi. Suhbatlar tarixi bazada saqlanib qoladi.` : undefined),
+    ),
   );
 }
 
@@ -1664,10 +1633,12 @@ async function doResetSetting(ctx: StaffContext, name: string | undefined): Prom
   const old = await getSetting(meta.key);
   await deleteSetting(meta.key);
   await ctx.answerCallbackQuery({ text: '♻️ Standart matn tiklandi' });
-  await render(ctx, {
-    text: resetDoneText(name, old),
-    keyboard: new InlineKeyboard().text("✏️ O'zgartirish", `adm:set:${name}`).text('⬅️ Admin panel', 'adm:home'),
-  });
+  await afterSuccess('standart matn tiklangani haqidagi xabar', () =>
+    render(ctx, {
+      text: resetDoneText(name, old),
+      keyboard: new InlineKeyboard().text("✏️ O'zgartirish", `adm:set:${name}`).text('⬅️ Admin panel', 'adm:home'),
+    }),
+  );
 }
 
 async function handleSettingInput(ctx: StaffContext, msg: TgMessage, st: SettingState): Promise<void> {
@@ -1687,7 +1658,7 @@ async function handleSettingInput(ctx: StaffContext, msg: TgMessage, st: Setting
     });
     if (ok === undefined) return;
     await stripKeyboard(ctx, st.promptMsgId);
-    await sendHtml(ctx, resetDoneText(st.key, old), { markup: kb });
+    await afterSuccess('standart matn tiklangani haqidagi xabar', () => sendHtml(ctx, resetDoneText(st.key, old), { markup: kb }));
     return;
   }
   if (!value) return reprompt(ctx, st, "Matn bo'sh bo'lmasligi kerak.", msg);
@@ -1706,7 +1677,8 @@ async function handleSettingInput(ctx: StaffContext, msg: TgMessage, st: Setting
     `✅ <b>${meta.title}</b> saqlandi.\n\n👀 Namuna (mijoz — Aziz, xodim — Dilnoza):\n` +
     `<blockquote expandable>${esc(truncate(sample, max))}</blockquote>`;
   const text = fit((a) => build(a), [[2500, 0], [1000, 0], [300, 0]], TEXT_LIMIT) ?? build(100);
-  await sendHtml(ctx, text, { markup: kb });
+  // Matn allaqachon saqlangan — tasdiq eng yaxshi urinish
+  await afterSuccess('matn saqlangani haqidagi tasdiq', () => sendHtml(ctx, text, { markup: kb }));
 }
 
 // ── Bekor qilish ──
@@ -1723,6 +1695,10 @@ async function onCancelFlow(ctx: StaffContext): Promise<void> {
       await render(ctx, await cardView(s));
       return;
     }
+  }
+  if (st?.step === 'dev_add' && can(ctx.panelRole, 'developer')) {
+    await render(ctx, await devHomeView('✖️ Bekor qilindi.'));
+    return;
   }
   await showHome(ctx, 'edit', '✖️ Bekor qilindi.');
 }
