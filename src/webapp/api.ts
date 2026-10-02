@@ -9,7 +9,15 @@
 import { createHash } from 'node:crypto';
 import { InputFile } from 'grammy';
 import { verifyInitData, type WebAppAuth, type WebAppUser } from '../auth.js';
-import { countComplaints } from '../complaints.js';
+import {
+  countComplaints,
+  getComplaintView,
+  isComplaintSubject,
+  listComplaints,
+  notifyClientResolved,
+  resolveComplaint,
+  type ComplaintView,
+} from '../complaints.js';
 import { json } from '../http.js';
 import { ROLE_TITLES, can, getPanelRole, type PanelRole } from '../roles.js';
 import {
@@ -38,8 +46,10 @@ import {
   getStaffByTgId,
   getStats,
   isStaffAvailable,
+  countStaffConversations,
   listAllStaff,
   listAvailableStaff,
+  listStaffConversations,
   listMessages,
   markReadByClient,
   normalizeLinkCode,
@@ -1509,6 +1519,152 @@ async function adminStats(ctx: StaffCtx): Promise<Data> {
   return { ...full, stats: full, panel_role: ctx.panelRole };
 }
 
+// ───────────────────────────── Shikoyatlar (Mini App: ROP / developer) ─────────────────────────────
+
+function requireComplaints(ctx: Ctx): StaffCtx {
+  const s = requireAdmin(ctx);
+  if (!can(s.panelRole, 'complaints')) throw new ApiError(403, 'admin_only', MSG.adminOnly);
+  return s;
+}
+
+function complaintDTO(c: ComplaintView): Data {
+  return {
+    id: c.id,
+    client_id: c.client_id,
+    staff_id: c.staff_id,
+    conversation_id: c.conversation_id,
+    text: c.text,
+    status: c.status,
+    created_at: c.created_at ? new Date(c.created_at).toISOString() : null,
+    submitted_at: c.submitted_at ? new Date(c.submitted_at).toISOString() : null,
+    resolved_at: c.resolved_at ? new Date(c.resolved_at).toISOString() : null,
+    client_name: clientName({ first_name: c.client_first_name, last_name: c.client_last_name }),
+    client_username: c.client_username,
+    staff_name: c.staff_full_name,
+    staff_role: c.staff_role,
+  };
+}
+
+const COMPLAINTS_PAGE = 20;
+const WATCH_PAGE = 20;
+
+async function complaintsList(ctx: Ctx): Promise<Data> {
+  const s = requireComplaints(ctx);
+  const raw = ctx.params.filter ?? ctx.params.status;
+  const filter = raw === 'all' ? 'all' : 'new';
+  const offset = Math.min(optNonNegInt(ctx.params.offset) ?? 0, 100_000);
+  const viewer = s.user.id;
+  const [items, nNew, nAll] = await Promise.all([
+    listComplaints({ status: filter, limit: COMPLAINTS_PAGE + 1, offset, excludeStaffTgId: viewer }),
+    countComplaints('new', viewer),
+    countComplaints('all', viewer),
+  ]);
+  const page = items.slice(0, COMPLAINTS_PAGE);
+  return {
+    complaints: page.map(complaintDTO),
+    has_more: items.length > COMPLAINTS_PAGE,
+    next_offset: offset + page.length,
+    filter,
+    total_new: nNew,
+    total_all: nAll,
+  };
+}
+
+async function loadComplaintOrThrow(ctx: StaffCtx, id: number): Promise<ComplaintView> {
+  const c = await getComplaintView(id);
+  if (!c) throw new ApiError(404, 'not_found', '⚠️ Shikoyat topilmadi.');
+  if (isComplaintSubject(c, ctx.user.id)) {
+    throw new ApiError(403, 'forbidden', '⛔ Bu shikoyat sizning ustingizdan — uni rahbariyatning boshqa aʼzosi koʻrib chiqadi.');
+  }
+  return c;
+}
+
+async function complaintsGet(ctx: Ctx): Promise<Data> {
+  const s = requireComplaints(ctx);
+  const c = await loadComplaintOrThrow(s, reqId(ctx.params.id ?? ctx.params.complaintId));
+  return { complaint: complaintDTO(c) };
+}
+
+/** Shikoyat suhbatini faqat o'qish uchun (o'qilgan belgilari o'zgarmaydi, yozib bo'lmaydi). */
+async function complaintsMessages(ctx: Ctx): Promise<Data> {
+  const s = requireComplaints(ctx);
+  const c = await loadComplaintOrThrow(s, reqId(ctx.params.id ?? ctx.params.complaintId));
+  if (!c.conversation_id) return { complaint: complaintDTO(c), conversation: null, messages: [], has_more: false, readonly: true, server_time: new Date().toISOString() };
+  const beforeId = optId(ctx.params.beforeId);
+  const limit = Math.min(pageLimit(ctx.params.limit), 50);
+  const [view, page] = await Promise.all([
+    getConversationView(c.conversation_id),
+    loadPage(c.conversation_id, beforeId, limit),
+  ]);
+  if (!view) throw new ApiError(404, 'not_found', MSG.convNotFound);
+  const conversation = staffConvSummary(view, null);
+  const messages = toDTOs({ role: 'staff' } as Pick<SyncCtx, 'role'>, page.messages).map((m) => ({ ...m, outgoing: false }));
+  return { complaint: complaintDTO(c), conversation, messages, has_more: page.has_more, readonly: true, server_time: new Date().toISOString() };
+}
+
+async function complaintsResolve(ctx: Ctx): Promise<Data> {
+  const s = requireComplaints(ctx);
+  const id = reqId(ctx.params.id ?? ctx.params.complaintId);
+  await loadComplaintOrThrow(s, id);
+  const resolved = await resolveComplaint(id, s.user.id);
+  if (!resolved) {
+    const cur = await getComplaintView(id);
+    if (cur?.status === 'resolved') throw new ApiError(400, 'already_resolved', 'ℹ️ Bu shikoyat allaqachon hal qilingan.');
+    throw new ApiError(403, 'forbidden', '⛔ Bu shikoyatni hal qilib boʻlmadi.');
+  }
+  notifyClientResolved(resolved).catch(() => {});
+  return { complaint: complaintDTO(resolved) };
+}
+
+// ───────────────────────────── Kuzatuv (Mini App: admin / ROP / developer, faqat o'qish) ─────────────────────────────
+
+async function watchStaff(ctx: Ctx): Promise<Data> {
+  requireAdmin(ctx);
+  const list = await listAllStaff();
+  return {
+    staff: list.map((st) => ({
+      id: st.id,
+      full_name: st.full_name,
+      role: st.role,
+      is_active: st.is_active,
+      is_online: st.is_online,
+      linked: st.tg_user_id != null,
+    })),
+  };
+}
+
+async function watchConversations(ctx: Ctx): Promise<Data> {
+  requireAdmin(ctx);
+  const staffId = reqId(ctx.params.staffId);
+  const st = await getStaff(staffId);
+  if (!st || st.deleted_at) throw new ApiError(404, 'staff_not_found', MSG.staffNotFound);
+  const offset = Math.min(optNonNegInt(ctx.params.offset) ?? 0, 100_000);
+  const total = await countStaffConversations(st.id);
+  const rows = total ? await listStaffConversations(st.id, { limit: WATCH_PAGE + 1, offset }) : [];
+  const page = rows.slice(0, WATCH_PAGE);
+  return {
+    staff_id: st.id,
+    staff_name: st.full_name,
+    conversations: page.map((r) => staffConvSummary(r, null)),
+    has_more: rows.length > WATCH_PAGE,
+    next_offset: offset + page.length,
+    total,
+  };
+}
+
+async function watchMessages(ctx: Ctx): Promise<Data> {
+  requireAdmin(ctx);
+  const convId = reqId(ctx.params.conversationId);
+  const view = await getConversationView(convId);
+  if (!view) throw new ApiError(404, 'not_found', MSG.convNotFound);
+  const beforeId = optId(ctx.params.beforeId);
+  const limit = Math.min(pageLimit(ctx.params.limit), 50);
+  const page = await loadPage(view.id, beforeId, limit);
+  const conversation = staffConvSummary(view, null);
+  const messages = toDTOs({ role: 'staff' } as Pick<SyncCtx, 'role'>, page.messages).map((m) => ({ ...m, outgoing: false }));
+  return { conversation, messages, has_more: page.has_more, readonly: true, server_time: new Date().toISOString() };
+}
+
 // ───────────────────────────── Marshrutlash ─────────────────────────────
 
 async function dispatch(action: string, ctx: Ctx): Promise<Data> {
@@ -1557,6 +1713,20 @@ async function dispatch(action: string, ctx: Ctx): Promise<Data> {
       return adminSettingsSet(requireAdmin(ctx));
     case 'admin.stats':
       return adminStats(requireAdmin(ctx));
+    case 'complaints.list':
+      return complaintsList(ctx);
+    case 'complaints.get':
+      return complaintsGet(ctx);
+    case 'complaints.messages':
+      return complaintsMessages(ctx);
+    case 'complaints.resolve':
+      return complaintsResolve(ctx);
+    case 'watch.staff':
+      return watchStaff(ctx);
+    case 'watch.conversations':
+      return watchConversations(ctx);
+    case 'watch.messages':
+      return watchMessages(ctx);
     default:
       throw new ApiError(400, 'unknown_action', MSG.unknownAction);
   }

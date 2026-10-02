@@ -39,8 +39,8 @@
     admin: 'Xodimlar, bot matnlari va statistika',
   };
   const COMPLAINTS_HINT = {
-    developer: 'Shikoyatlar, ommaviy xabar va developer paneli — xodimlar botidagi «⚙️ Admin panel» da.',
-    rop: 'Shikoyatlar va ommaviy xabar — xodimlar botidagi «⚙️ Admin panel» da.',
+    developer: 'Shikoyatlar roʻyxati, suhbatni oʻqish va «Hal qilindi» — shu ilovadagi «⚠️ Shikoyatlar» boʻlimida.',
+    rop: 'Shikoyatlar roʻyxati, suhbatni oʻqish va «Hal qilindi» — shu ilovadagi «⚠️ Shikoyatlar» boʻlimida.',
   };
 
   /** Serverdagi panel_role -> 'developer' | 'rop' | 'admin' (is_admin bor-u rol kelmagan eski server — 'admin'). */
@@ -3175,7 +3175,9 @@
       loadingOlder = true;
       olderEl.hidden = false;
       try {
-        const res = await api('messages', { conversationId: conv.id, beforeId: ids[0], limit: 50 });
+        const res = opts.loadPage
+          ? await opts.loadPage(ids[0], 50)
+          : await api('messages', { conversationId: conv.id, beforeId: ids[0], limit: 50 });
         if (destroyed) return;
         const prevH = scroller.scrollHeight;
         const prevTop = scroller.scrollTop;
@@ -3270,7 +3272,7 @@
 
     // ── Sync (poller chaqiradi) ──
     self.convId = () => conv.id;
-    self.canSync = () => ready && !destroyed && !syncDisabled && !!conv.id;
+    self.canSync = () => !opts.noSync && ready && !destroyed && !syncDisabled && !!conv.id;
     self.syncParams = (tick) => {
       let after = syncAfterId;
       // Har 5-so'rovda oxirgi bir nechta xabarni qayta so'raymiz: bir vaqtda yozilgan xabarlardan kichik id lisi
@@ -3798,16 +3800,21 @@
   function StaffRoot() {
     const me = S.me;
     const tabs = [];
+    const canComplaints = S.panelRole === 'rop' || S.panelRole === 'developer';
     if (me) {
       tabs.push({ id: 'chats', emoji: '💬', label: 'Chatlar' });
       tabs.push({ id: 'profile', emoji: '👤', label: 'Profil' });
     }
+    if (canComplaints) tabs.push({ id: 'complaints', emoji: '⚠️', label: 'Shikoyatlar' });
+    if (S.isAdmin) tabs.push({ id: 'watch', emoji: '👁', label: 'Kuzatuv' });
     if (S.isAdmin) tabs.push({ id: 'admin', emoji: '⚙️', label: 'Admin' });
 
     const titleEl = h('h1', { class: 'topbar-title' });
     const subtitleEl = h('div', { class: 'topbar-sub' });
     const chip = me ? h('button', { class: 'status-chip', type: 'button', onclick: () => toggleOnline() }) : null;
     let adminPanel = null;
+    let complaintsPanel = null;
+    let watchPanel = null;
     const unsubs = [];
 
     const root = TabbedRoot({
@@ -3817,6 +3824,8 @@
       tabs: tabs,
       onTab: (id) => {
         if (id === 'admin' && adminPanel) adminPanel.ensureLoaded();
+        if (id === 'complaints' && complaintsPanel) complaintsPanel.ensureLoaded();
+        if (id === 'watch' && watchPanel) watchPanel.ensureLoaded();
       },
     });
 
@@ -4074,6 +4083,16 @@
       renderProfile();
     }
 
+    // ── Shikoyatlar (ROP / developer) ──
+    if (canComplaints) {
+      complaintsPanel = ComplaintsPanel(root.panel('complaints'), root);
+    }
+
+    // ── Kuzatuv (admin / ROP / developer, faqat o'qish) ──
+    if (S.isAdmin) {
+      watchPanel = WatchPanel(root.panel('watch'));
+    }
+
     // ── Admin ──
     if (S.isAdmin) {
       adminPanel = AdminPanel(root.panel('admin'));
@@ -4118,6 +4137,8 @@
       el: root.el,
       onShow() {
         if (root.current() === 'admin' && adminPanel && A.dirty) adminPanel.refresh();
+        if (root.current() === 'complaints' && complaintsPanel) complaintsPanel.ensureLoaded();
+        if (root.current() === 'watch' && watchPanel) watchPanel.ensureLoaded();
         bus.emit('convs');
       },
       destroy() {
@@ -4125,6 +4146,353 @@
         if (adminPanel) adminPanel.destroy();
       },
     };
+  }
+
+  // ═══════════════════════════ Shikoyatlar (Mini App: ROP / developer) ═══════════════════════════
+
+  function normComplaint(c) {
+    c = c || {};
+    return {
+      id: num(c.id) || null,
+      client_id: num(c.client_id) || null,
+      staff_id: num(c.staff_id) || null,
+      conversation_id: num(c.conversation_id) || null,
+      text: str(c.text),
+      status: c.status === 'resolved' ? 'resolved' : 'new',
+      created_at: c.created_at || null,
+      submitted_at: c.submitted_at || c.created_at || null,
+      client_name: str(c.client_name) || 'Mijoz',
+      client_username: str(c.client_username),
+      staff_name: str(c.staff_name) || 'Xodim',
+      staff_role: c.staff_role === 'manager' ? 'manager' : 'operator',
+    };
+  }
+
+  function openReadonlyChat(conv, load, loadPage) {
+    if (nav.locked()) return;
+    nav.push(ChatScreen({ conv: conv, unread: 0, noSync: true, load: load, loadPage: loadPage }));
+  }
+
+  function ComplaintsPanel(container, root) {
+    let filter = 'new';
+    let items = [];
+    let hasMore = false;
+    let nextOffset = 0;
+    let loading = false;
+    let loaded = false;
+    let loadError = null;
+
+    const filterEl = h('div', { class: 'seg' }, [
+      h('button', { type: 'button', 'data-f': 'new', 'aria-pressed': 'true' }, '🆕 Yangilar'),
+      h('button', { type: 'button', 'data-f': 'all', 'aria-pressed': 'false' }, '📋 Hammasi'),
+    ]);
+    const listEl = h('div', { class: 'list' });
+    const stateEl = h('div', { class: 'center-state', hidden: true });
+    const moreWrap = h('div', { class: 'list-more', hidden: true }, h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load(false) }, "⬇️ Ko'proq yuklash"));
+    append(container, [
+      h('div', { class: 'sec-title' }, h('span', { text: '⚠️ Shikoyatlar — faqat oʻqish va hal qilish' })),
+      filterEl,
+      listEl,
+      stateEl,
+      moreWrap,
+      h('p', { class: 'legend', text: '🔒 Oʻz ustingizdagi shikoyatlar roʻyxatda koʻrinmaydi — ularni rahbariyatning boshqa aʼzosi koʻrib chiqadi.' }),
+    ]);
+
+    filterEl.querySelectorAll('button').forEach((b) => {
+      b.addEventListener('click', () => {
+        if (filter !== b.dataset.f) {
+          filter = b.dataset.f;
+          haptic.select();
+          load(true);
+        }
+      });
+    });
+
+    function render() {
+      filterEl.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.f === filter ? 'true' : 'false'));
+      clear(listEl);
+      if (!items.length && loaded && !loading) {
+        listEl.appendChild(h('div', { class: 'center-state', style: 'padding:22px 16px' }, [h('span', { text: filter === 'new' ? "Yangi shikoyatlar yo'q 🎉" : "Hozircha shikoyatlar yo'q 🎉" })]));
+      }
+      items.forEach((c) => {
+        const icon = c.status === 'new' ? '🆕' : '✅';
+        listEl.appendChild(
+          h('button', { class: 'row', type: 'button', onclick: () => nav.push(ComplaintScreen(c.id)) }, [
+            h('div', { class: 'row-main' }, [
+              h('div', { class: 'row-top' }, [
+                h('span', { class: 'row-name', text: '#' + c.id + ' ' + icon + ' ' + c.staff_name }),
+                h('span', { class: 'row-time', text: listTime(c.submitted_at) }),
+              ]),
+              h('div', { class: 'row-sub', text: c.client_name + (c.client_username ? ' ( @' + c.client_username + ' )' : '') + ' · ' + clip(c.text, 80) }),
+            ]),
+            icon('chev', 'chev'),
+          ]),
+        );
+      });
+      moreWrap.hidden = !hasMore;
+      clear(stateEl);
+      if (loading && !items.length) {
+        stateEl.hidden = false;
+        stateEl.appendChild(spinner());
+      } else if (loadError && !items.length) {
+        stateEl.hidden = false;
+        append(stateEl, [
+          h('div', { text: loadError }),
+          h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load(true) }, '🔄 Qayta urinish'),
+        ]);
+      } else {
+        stateEl.hidden = true;
+      }
+    }
+
+    async function load(reset) {
+      if (loading) return;
+      loading = true;
+      loadError = null;
+      if (reset) {
+        items = [];
+        nextOffset = 0;
+        hasMore = false;
+      }
+      render();
+      try {
+        const res = await api('complaints.list', { filter: filter, offset: reset ? 0 : nextOffset });
+        const got = arr(res.complaints).map(normComplaint).filter((c) => c.id);
+        items = reset ? got : items.concat(got.filter((c) => !items.some((x) => x.id === c.id)));
+        hasMore = !!res.has_more;
+        nextOffset = num(res.next_offset) || items.length;
+        loaded = true;
+        if (root && num(res.total_new) >= 0) root.setBadge('complaints', num(res.total_new));
+      } catch (e) {
+        loadError = e.message || MSG.generic;
+        if (items.length) reportError(e);
+      } finally {
+        loading = false;
+        render();
+      }
+    }
+
+    return { ensureLoaded() { if (!loaded && !loading) load(true); }, refresh: () => load(true) };
+  }
+
+  function ComplaintScreen(id) {
+    const self = { type: 'complaint' };
+    const bodyEl = h('div', { class: 'screen-body' }, h('div', { class: 'center-state' }, spinner()));
+    self.el = h('section', { class: 'form-screen' }, [screenBar('⚠️ Shikoyat #' + id), bodyEl]);
+    let destroyed = false;
+
+    async function load() {
+      try {
+        const res = await api('complaints.get', { id: id });
+        if (destroyed) return;
+        render(normComplaint(res.complaint));
+      } catch (e) {
+        if (destroyed) return;
+        clear(bodyEl).appendChild(
+          h('div', { class: 'center-state' }, [h('div', { text: e.message || MSG.generic }), h('button', { class: 'btn sm secondary', type: 'button', onclick: load }, '🔄 Qayta urinish')]),
+        );
+      }
+    }
+
+    function render(c) {
+      clear(bodyEl);
+      const statusBadge = h('span', { class: 'badge ' + (c.status === 'new' ? 'on' : 'off'), text: c.status === 'new' ? '🆕 Yangi' : '✅ Hal qilingan' });
+      append(bodyEl, [
+        h('div', { class: 'info-block' }, [
+          h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Holat' }), statusBadge]),
+          h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Xodim' }), h('div', { class: 'info-value', text: c.staff_name })]),
+          h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Mijoz' }), h('div', { class: 'info-value', text: c.client_name + (c.client_username ? ' (@' + c.client_username + ')' : '') })]),
+          h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Vaqti' }), h('div', { class: 'info-value', text: fullDate(c.submitted_at) })]),
+          h('div', { class: 'info-item' }, [h('div', { class: 'info-label', text: 'Matn' }), h('div', { class: 'info-value', text: c.text || '—' })]),
+        ]),
+        h('div', { class: 'sheet-actions' }, [
+          c.conversation_id ? h('button', { class: 'btn secondary', type: 'button', onclick: openTranscript }, "💬 Suhbatni ko'rish") : null,
+          c.status === 'new' ? h('button', { class: 'btn', type: 'button', onclick: resolve }, '✅ Hal qilindi') : null,
+        ]),
+        h('p', { class: 'note', text: "🔒 Suhbat faqat oʻqish uchun ochiladi — yozib boʻlmaydi, oʻqilgan belgilari oʻzgarmaydi." }),
+      ]);
+    }
+
+    async function openTranscript() {
+      try {
+        const first = await api('complaints.messages', { id: id, limit: 50 });
+        if (destroyed) return;
+        const conv = normConv(first.conversation);
+        openReadonlyChat(
+          conv,
+          async () => ({ conversation: null, messages: first.messages, has_more: first.has_more, readonly: true, server_time: first.server_time }),
+          async (beforeId, limit) => api('complaints.messages', { id: id, beforeId: beforeId, limit: limit || 50 }),
+        );
+      } catch (e) {
+        reportError(e);
+      }
+    }
+
+    async function resolve() {
+      if (!(await confirmDialog('Shikoyat #' + id + ' hal qilindi deb belgilansinmi? Mijozga xabar boradi.'))) return;
+      try {
+        await api('complaints.resolve', { id: id });
+        toast('✅ Hal qilindi', 'success');
+        nav.pop();
+      } catch (e) {
+        reportError(e);
+      }
+    }
+
+    load();
+    self.destroy = () => { destroyed = true; };
+    return self;
+  }
+
+  // ═══════════════════════════ Kuzatuv (Mini App: admin / ROP / developer) ═══════════════════════════
+
+  function WatchPanel(container) {
+    let staff = [];
+    let loading = false;
+    let loaded = false;
+    let loadError = null;
+    const listEl = h('div', { class: 'list' });
+    const stateEl = h('div', { class: 'center-state', hidden: true });
+    append(container, [
+      h('div', { class: 'sec-title' }, h('span', { text: '👁 Chatlar kuzatuvi — faqat oʻqish' })),
+      listEl,
+      stateEl,
+      h('p', { class: 'legend', text: "🔒 Sizga xabarlar kelmaydi — faqat kirib oʻqiysiz. Yozib boʻlmaydi." }),
+    ]);
+
+    function render() {
+      clear(listEl);
+      staff.forEach((s) => {
+        const sub = (s.linked ? (s.is_active ? '🟢 Faol' : '🚫 Bloklangan') : '⏳ Ulanmagan');
+        listEl.appendChild(
+          h('button', { class: 'row', type: 'button', onclick: () => nav.push(WatchConvsScreen(s)) }, [
+            h('div', { class: 'row-main' }, [
+              h('div', { class: 'row-top' }, [h('span', { class: 'row-name', text: s.full_name })]),
+              h('div', { class: 'row-sub', text: sub }),
+            ]),
+            icon('chev', 'chev'),
+          ]),
+        );
+      });
+      clear(stateEl);
+      if (loading && !loaded) {
+        stateEl.hidden = false;
+        stateEl.appendChild(spinner());
+      } else if (loadError && !loaded) {
+        stateEl.hidden = false;
+        append(stateEl, [
+          h('div', { text: loadError }),
+          h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load() }, '🔄 Qayta urinish'),
+        ]);
+      } else {
+        stateEl.hidden = true;
+      }
+      if (loaded && !staff.length && !loading) {
+        listEl.appendChild(h('div', { class: 'center-state', style: 'padding:22px 16px' }, [h('span', { text: "Hozircha xodimlar yo'q" })]));
+      }
+    }
+
+    async function load() {
+      if (loading) return;
+      loading = true;
+      loadError = null;
+      render();
+      try {
+        const res = await api('watch.staff');
+        staff = arr(res.staff).map((s) => ({ id: num(s.id), full_name: str(s.full_name) || 'Xodim', role: s.role, is_active: s.is_active !== false, linked: !!s.linked })).filter((s) => s.id);
+        loaded = true;
+      } catch (e) {
+        loadError = e.message || MSG.generic;
+        if (loaded) reportError(e);
+      } finally {
+        loading = false;
+        render();
+      }
+    }
+
+    return { ensureLoaded() { if (!loaded && !loading) load(); }, refresh: () => load() };
+  }
+
+  function WatchConvsScreen(st) {
+    const self = { type: 'watch-convs' };
+    let items = [];
+    let hasMore = false;
+    let nextOffset = 0;
+    let loading = false;
+    let destroyed = false;
+    const listEl = h('div', { class: 'list' });
+    const stateEl = h('div', { class: 'center-state' }, spinner());
+    const moreWrap = h('div', { class: 'list-more', hidden: true }, h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load(false) }, "⬇️ Ko'proq yuklash"));
+    const bodyEl = h('div', { class: 'screen-body' }, [listEl, stateEl, moreWrap]);
+    self.el = h('section', { class: 'form-screen' }, [screenBar('👁 ' + st.full_name), bodyEl]);
+
+    function render() {
+      clear(listEl);
+      items.forEach((c) => {
+        const unread = c.unread > 0 ? '🔴' + c.unread + ' ' : '';
+        listEl.appendChild(
+          h('button', { class: 'row', type: 'button', onclick: () => openWatchChat(c) }, [
+            h('div', { class: 'row-main' }, [
+              h('div', { class: 'row-top' }, [
+                h('span', { class: 'row-name', text: unread + c.peer.name }),
+                h('span', { class: 'row-time', text: listTime(c.last_message_at) }),
+              ]),
+              h('div', { class: 'row-sub', text: c.last_message_preview || "Hali xabar yo'q" }),
+            ]),
+            icon('chev', 'chev'),
+          ]),
+        );
+      });
+      moreWrap.hidden = !hasMore;
+      clear(stateEl);
+      if (loading && !items.length) stateEl.appendChild(spinner());
+      else if (!loading && !items.length) stateEl.appendChild(h('div', { text: "Bu xodimda hali suhbatlar yo'q" }));
+      else stateEl.hidden = true;
+    }
+
+    async function load(reset) {
+      if (loading || destroyed) return;
+      loading = true;
+      if (reset) {
+        items = [];
+        nextOffset = 0;
+        hasMore = false;
+      }
+      render();
+      try {
+        const res = await api('watch.conversations', { staffId: st.id, offset: reset ? 0 : nextOffset });
+        const got = arr(res.conversations).map(normConv).filter((c) => c.id);
+        items = reset ? got : items.concat(got.filter((c) => !items.some((x) => x.id === c.id)));
+        hasMore = !!res.has_more;
+        nextOffset = num(res.next_offset) || items.length;
+      } catch (e) {
+        if (!items.length) {
+          clear(stateEl).appendChild(h('div', { text: e.message || MSG.generic }));
+        } else reportError(e);
+      } finally {
+        loading = false;
+        if (!destroyed) render();
+      }
+    }
+
+    async function openWatchChat(c) {
+      try {
+        const first = await api('watch.messages', { conversationId: c.id, limit: 50 });
+        if (destroyed) return;
+        const conv = normConv(first.conversation);
+        openReadonlyChat(
+          conv,
+          async () => ({ conversation: null, messages: first.messages, has_more: first.has_more, readonly: true, server_time: first.server_time }),
+          async (beforeId, limit) => api('watch.messages', { conversationId: c.id, beforeId: beforeId, limit: limit || 50 }),
+        );
+      } catch (e) {
+        reportError(e);
+      }
+    }
+
+    load(true);
+    self.destroy = () => { destroyed = true; };
+    return self;
   }
 
   function openStaffChat(conv) {

@@ -392,13 +392,14 @@ export function staffCaption(s: Staff): string {
   return html;
 }
 
-/** Karta tugmalari: karusel, "Yozish", "Ro'yxat". index = -1 bo'lsa karusel qatori ko'rsatilmaydi. */
+/** Karta tugmalari: karusel, "Yozish", "Shikoyat", "Ro'yxat". index = -1 bo'lsa karusel qatori ko'rsatilmaydi. */
 export function cardMarkup(s: Staff, index: number, total: number): InlineKeyboardMarkup {
   const rows: Rows = [];
   if (total > 1 && index >= 0) {
     rows.push([cb('◀️', `nav:${s.id}:prev`), cb(`${index + 1}/${total}`, 'noop'), cb('▶️', `nav:${s.id}:next`)]);
   }
   rows.push([cb('✍️ Yozish', `pick:${s.id}`)]);
+  rows.push([cb('⚠️ Shikoyat qilish', `cmp:${s.id}`)]);
   rows.push([cb("📋 Ro'yxat", `ls:${s.role}`)]);
   return markup(rows);
 }
