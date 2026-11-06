@@ -106,6 +106,15 @@ npm run setup -- --info
 
 **Shikoyatlar:** mijoz `/shikoyat` → yozishgan xodimini tanlaydi → shikoyat matnini yozadi. Shikoyat **xodimga ko'rinmaydi**; ROP va developerga darhol bildirishnoma keladi. «⚠️ Shikoyatlar» da ko'rib chiqib «✅ Hal qilindi» bosilsa, mijozga «shikoyatingiz ko'rib chiqildi» xabari boradi.
 
+## 4.2. Bitta bot rejimi (mijozlar va xodimlar bitta botda)
+
+Vercel → Environment Variables da `STAFF_BOT_TOKEN` ga **mijozlar botining tokenini** yozing (`CLIENT_BOT_TOKEN` bilan bir xil), qayta deploy qiling va `npm run setup -- https://uzgrow-bot.vercel.app` ni ishga tushiring.
+
+- Bot kim yozganini o'zi aniqlaydi: **xodim yoki admin/ROP/developer** — xodimlar paneli (chatlar, javob berish, admin panel, «💬 Chatlar» Mini App), **qolganlar** — mijoz qismi.
+- Xodim ulanishi o'zgarmaydi: admin bergan taklif havolasi (`?start=inv_…`) endi shu botga olib boradi.
+- Har bir operator faqat o'z chatlarini ko'radi — xuddi oldingidek.
+- Ikki bot rejimiga qaytish: `STAFF_BOT_TOKEN` ga yana xodimlar boti tokenini yozib, setup'ni qayta ishga tushiring.
+
 ## 5. Qanday ishlaydi
 
 **Mijoz:**

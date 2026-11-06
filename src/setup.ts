@@ -2,6 +2,7 @@
 import { webhookSecretFor } from './auth.js';
 import { config } from './config.js';
 import { db } from './db.js';
+import { getAppUrl } from './links.js';
 import { ensureLinkCodes, setSetting } from './repo.js';
 import { panelRecipients } from './roles.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
@@ -89,6 +90,19 @@ export const STAFF_ADMIN_COMMANDS = [
   { command: 'admin', description: '⚙️ Admin panel' },
   ...STAFF_COMMANDS.slice(1),
 ];
+
+/**
+ * Bitta bot rejimi: xodim/panel foydalanuvchisi chatiga xodim buyruqlari (+ /admin) va «💬 Chatlar» Mini App tugmasi.
+ * Bot umumiy menyusi mijozlarniki bo'lib qoladi.
+ */
+export async function syncStaffChat(api: Api, chatId: number, appUrl?: string): Promise<void> {
+  const panel = (await panelRecipients('panel')).includes(chatId);
+  await api.setMyCommands(panel ? STAFF_ADMIN_COMMANDS : STAFF_COMMANDS, { scope: { type: 'chat', chat_id: chatId } });
+  const base = appUrl ?? (await getAppUrl());
+  if (/^https:\/\//.test(base)) {
+    await api.setChatMenuButton({ chat_id: chatId, menu_button: { type: 'web_app', text: '💬 Chatlar', web_app: { url: `${base}/app/` } } });
+  }
+}
 
 /** Admin chatiga /admin buyrug'i bilan menyu o'rnatish (admin botni hali boshlamagan bo'lsa xato beradi). */
 export async function setAdminCommands(api: Api, adminId: number): Promise<void> {
@@ -253,7 +267,16 @@ export async function runSetup(appUrl: string, opts: SetupOptions = {}): Promise
   await setSetting(SETTING_KEYS.appUrl, url);
   const report: SetupReport = { appUrl: url, migrated: true, bots: {} };
   report.bots.client = await setupBot('client', url);
-  report.bots.staff = config.hasStaffBot ? await setupBot('staff', url) : { ok: false, error: 'STAFF_BOT_TOKEN berilmagan' };
+  if (config.singleBot) {
+    // Bitta bot: webhook bitta (mijozlar boti), xodim/panel chatlariga — o'z buyruqlari va «💬 Chatlar» tugmasi
+    const api = apiFor('client')!;
+    const staffIds = (await db()<{ tg_user_id: number }[]>`
+      select tg_user_id from staff where tg_user_id is not null and deleted_at is null`).map((r) => r.tg_user_id);
+    for (const id of new Set([...staffIds, ...(await panelRecipients('panel'))])) await syncStaffChat(api, id, url).catch(() => {});
+    report.bots.staff = { ok: true, webhook: 'bitta bot rejimi — mijozlar boti bilan bir xil' };
+  } else {
+    report.bots.staff = config.hasStaffBot ? await setupBot('staff', url) : { ok: false, error: 'STAFF_BOT_TOKEN berilmagan' };
+  }
   for (const kind of ['client', 'staff'] as const) {
     const info = report.bots[kind]?.info;
     // Faqat yaqindagi (so'nggi 1 soat) xatolar — eskisi allaqachon hal bo'lgan bo'lishi mumkin

@@ -539,7 +539,7 @@ export async function sendContent(
   let media: string | InputFile;
   if (content.upload) {
     media = new InputFile(content.upload.data, content.upload.fileName);
-  } else if (content.fileId && sourceBot === target) {
+  } else if (content.fileId && (sourceBot === target || config.singleBot)) {
     media = content.fileId;
   } else if (content.fileId) {
     const { data } = await downloadFile(sourceBot, content.fileId);

@@ -23,6 +23,10 @@ export const config = {
   get hasStaffBot(): boolean {
     return read('STAFF_BOT_TOKEN') !== '';
   },
+  /** Bitta bot rejimi: STAFF_BOT_TOKEN = CLIENT_BOT_TOKEN — mijozlar ham, xodimlar ham bitta botda. */
+  get singleBot(): boolean {
+    return this.hasStaffBot && this.staffBotToken === read('CLIENT_BOT_TOKEN');
+  },
   get databaseUrl(): string {
     return required('DATABASE_URL');
   },

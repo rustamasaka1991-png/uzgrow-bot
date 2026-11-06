@@ -25,7 +25,7 @@ import {
   updateStaffUsername,
 } from '../repo.js';
 import { ROLE_TITLES, can, getPanelRole, panelRecipients, type PanelRole } from '../roles.js';
-import { setAdminCommands } from '../setup.js';
+import { setAdminCommands, syncStaffChat } from '../setup.js';
 import { greetingText } from '../texts.js';
 import { extractContent, react, retryOnFlood } from '../tg.js';
 import type { Conversation, ConversationView, Staff } from '../types.js';
@@ -225,7 +225,10 @@ async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
   // Tugallanmagan panel amali bekor qilinadi (so'rov xabaridagi tugmalar ham olib tashlanadi) — huquqi olib
   // tashlangan foydalanuvchida qolib ketgan holat ham
   await dropAdminState(ctx);
-  if (ctx.admin) {
+  if (config.singleBot) {
+    // Bitta bot: umumiy menyu mijozlarniki — xodim/panel chatiga o'z buyruqlari va «💬 Chatlar» tugmasi
+    if (ctx.staff || ctx.admin) await syncStaffChat(ctx.api, ctx.from!.id).catch(() => {});
+  } else if (ctx.admin) {
     // /admin buyrug'i faqat panel foydalanuvchilari menyusida ko'rinsin (setup vaqtida ularning chati hali bo'lmagan bo'lishi mumkin)
     await setAdminCommands(ctx.api, ctx.from!.id).catch((e) =>
       console.warn('[staff] admin buyruqlari o\'rnatilmadi:', tgErrorDescription(e)),
@@ -238,6 +241,7 @@ async function onStart(ctx: CommandContext<StaffContext>): Promise<void> {
 
   if (payload.startsWith('inv_')) {
     await handleInvite(ctx, payload.slice(4));
+    if (config.singleBot && (await getStaffByTgId(ctx.from!.id))) await syncStaffChat(ctx.api, ctx.from!.id).catch(() => {});
     return;
   }
 

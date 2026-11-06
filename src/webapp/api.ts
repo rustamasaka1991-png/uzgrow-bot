@@ -8,6 +8,7 @@
 // bog'liq bo'lgani uchun qoldirilgan.
 import { createHash } from 'node:crypto';
 import { InputFile } from 'grammy';
+import { config } from '../config.js';
 import { verifyInitData, type WebAppAuth, type WebAppUser } from '../auth.js';
 import {
   countComplaints,
@@ -450,8 +451,10 @@ function authenticate(parsed: ParsedRequest): WebAppAuth {
   if (!parsed.initData) throw new ApiError(401, 'unauthorized', MSG.unauthorized);
   const auth = verifyInitData(parsed.initData);
   if (!auth) throw new ApiError(401, 'unauthorized', MSG.unauthorized);
-  if (auth.bot !== 'staff') throw new ApiError(403, 'client_app_disabled', MSG.clientAppDisabled);
-  return auth;
+  if (auth.bot === 'staff') return auth;
+  // Bitta bot rejimi: initData mijozlar boti tokeni bilan imzolangan — xodim/panel ekanini buildContext tekshiradi
+  if (config.singleBot) return { ...auth, bot: 'staff' };
+  throw new ApiError(403, 'client_app_disabled', MSG.clientAppDisabled);
 }
 
 /**

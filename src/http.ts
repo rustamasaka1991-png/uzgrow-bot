@@ -35,6 +35,11 @@ export interface WebhookHooks {
    * xabarlarni yetkazish. Xatolari faqat logga yoziladi.
    */
   afterUpdate?: (update: Update) => Promise<void>;
+  /**
+   * Bitta bot rejimi: update ni boshqa bot logikasiga yo'naltirish (masalan, xodim yozsa — xodimlar boti).
+   * null — odatdagi getBot/afterUpdate.
+   */
+  route?: (update: Update) => Promise<{ getBot: () => Promise<Bot>; afterUpdate?: (update: Update) => Promise<void> } | null>;
 }
 
 /**
@@ -74,8 +79,11 @@ export function createWebhookHandler(kind: BotKind, getBot: () => Promise<Bot>, 
     }
 
     let bot: Bot;
+    let afterUpdate = hooks.afterUpdate;
     try {
-      bot = await getBot();
+      const target = hooks.route ? await hooks.route(update) : null;
+      if (target) afterUpdate = target.afterUpdate;
+      bot = await (target?.getBot ?? getBot)();
     } catch (e) {
       // Bot ishga tushmadi (masalan, getMe tarmoq xatosi yoki vaqt tugadi) — update yo'qolmasin: belgini olib
       // tashlaymiz, Telegram uni keyinroq qayta yuboradi.
@@ -90,9 +98,9 @@ export function createWebhookHandler(kind: BotKind, getBot: () => Promise<Bot>, 
       // BotError ichida ctx (butun update — mijoz matni) va Telegram payload i bor — faqat xavfsiz tavsif yoziladi
       console.error(`[${kind}] update #${update.update_id} ni qayta ishlashda xato:`, describeError(e));
     }
-    if (hooks.afterUpdate) {
+    if (afterUpdate) {
       try {
-        await hooks.afterUpdate(update);
+        await afterUpdate(update);
       } catch (e) {
         console.error(`[${kind}] update #${update.update_id} dan keyingi ishlov xatosi:`, describeError(e));
       }
