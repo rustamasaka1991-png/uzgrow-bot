@@ -7,7 +7,7 @@ import { signMediaToken } from './auth.js';
 import { db } from './db.js';
 import { getAppUrl } from './links.js';
 import { vercelWaitUntil } from './redeliver.js';
-import { deleteSetting, getSetting, setSetting } from './repo.js';
+import { deleteSetting, getSetting, getStaff, setSetting } from './repo.js';
 import type { Client, Content, Message, Staff } from './types.js';
 import { clientName, describeError, sleep } from './util.js';
 
@@ -152,6 +152,55 @@ async function amoRest(path: string, payload: unknown): Promise<unknown> {
 
 /** Bot xodimi -> amoCRM foydalanuvchisi (settings: amo_user:<staffId> = amoCRM user id). */
 export const amoUserKey = (staffId: number): string => `amo_user:${staffId}`;
+
+const CYR: Record<string, string> = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'j', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm',
+  н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'x', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sh',
+  ъ: '', ы: 'i', ь: '', э: 'e', ю: 'yu', я: 'ya', ў: 'o', қ: 'q', ғ: 'g', ҳ: 'h',
+};
+
+/** Ismni solishtirish uchun: lotinga o'giriladi, belgilar olib tashlanadi, so'zlar tartibi ahamiyatsiz. */
+export function nameKey(name: string): string {
+  return [...name.toLowerCase()]
+    .map((ch) => CYR[ch] ?? ch)
+    .join('')
+    .replace(/kh/g, 'x')
+    .replace(/[^a-z\s]/g, '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .sort()
+    .join(' ');
+}
+
+let usersCache: { at: number; users: { id: number; key: string }[] } | null = null;
+
+/**
+ * Xodim hali bog'lanmagan bo'lsa — amoCRM dagi faol foydalanuvchilar ichidan ismi bir xil (kirill/lotin, so'z
+ * tartibi farqi hisobga olinmaydi) BITTA foydalanuvchi topilsa, avtomatik bog'lanadi va saqlanadi.
+ */
+async function amoUserFor(staffId: number): Promise<number | null> {
+  const saved = Number(await getSetting(amoUserKey(staffId)));
+  if (saved) return saved;
+  const staff = await getStaff(staffId);
+  if (!staff) return null;
+  if (!usersCache || Date.now() - usersCache.at > 10 * 60_000) {
+    const res = await fetch(`https://${env('AMOCRM_DOMAIN')}/api/v4/users?limit=250`, {
+      headers: { Authorization: `Bearer ${env('AMOCRM_TOKEN')}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`amoCRM /api/v4/users: HTTP ${res.status}`);
+    const j = (await res.json()) as { _embedded?: { users?: { id: number; name: string; rights?: { is_active?: boolean } }[] } };
+    usersCache = {
+      at: Date.now(),
+      users: (j._embedded?.users ?? []).filter((u) => u.rights?.is_active !== false).map((u) => ({ id: u.id, key: nameKey(u.name) })),
+    };
+  }
+  const key = nameKey(staff.full_name);
+  const found = usersCache.users.filter((u) => u.key === key);
+  if (found.length !== 1) return null; // topilmadi yoki bir xil ismli bir nechta — qo'lda bog'lanadi
+  await setSetting(amoUserKey(staffId), String(found[0]!.id));
+  return found[0]!.id;
+}
 const chatKey = (conversationId: number): string => `amo_chat:${conversationId}`;
 const PENDING = 'pending';
 
@@ -166,7 +215,10 @@ async function ensureAssignedChat(conversationId: number, client: Client, staffI
   const key = chatKey(conversationId);
   const existing = await getSetting(key);
   if (existing && existing !== PENDING) return;
-  const amoUser = Number(await getSetting(amoUserKey(staffId)));
+  const amoUser = await amoUserFor(staffId).catch((e) => {
+    console.error(`[amocrm] xodim #${staffId} uchun amoCRM foydalanuvchisini topib bo'lmadi:`, describeError(e));
+    return null;
+  });
   if (!amoUser) return;
   // Parallel xabarlar bitta lid ochsin: birinchisi «band qiladi», qolganlari tayyor bo'lishini qisqa kutadi
   const claimed = await db()`

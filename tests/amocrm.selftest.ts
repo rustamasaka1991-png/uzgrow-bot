@@ -1,7 +1,7 @@
 // amoCRM imzolari va suhbat ID formati uchun kichik tekshiruv: npx tsx tests/amocrm.selftest.ts
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
-import { amoConversationId, parseAmoConversationId, signRequest, verifyHookSignature } from '../src/amocrm.js';
+import { amoConversationId, nameKey, parseAmoConversationId, signRequest, verifyHookSignature } from '../src/amocrm.js';
 
 const secret = '5a44c5dff55f3c15a4cce8d7c4cc27e207c7e189';
 const body = '{"a":1}';
@@ -28,5 +28,12 @@ assert.equal(h['X-Signature'], expected);
 assert.equal(parseAmoConversationId(amoConversationId(42)), 42);
 assert.equal(parseAmoConversationId('boshqa-42'), null);
 assert.equal(parseAmoConversationId(undefined), null);
+
+// Ism moslashi (kirill/lotin, so'z tartibi, kh/x)
+assert.equal(nameKey('Мухитдинова Нодира'), nameKey('Muxitdinova Nodira'));
+assert.equal(nameKey('Nodira Muxitdinova'), nameKey('Muxitdinova Nodira'));
+assert.equal(nameKey('Mukhitdinova  Nodira!'), nameKey('Muxitdinova Nodira'));
+assert.equal(nameKey("Bazarbayeva Nurg'ul"), nameKey('Bazarbayeva Nurgul'));
+assert.notEqual(nameKey('Aziza Isaeva'), nameKey('Aziza Karimova'));
 
 console.log('amocrm selftest: OK');
