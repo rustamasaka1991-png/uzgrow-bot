@@ -4,11 +4,12 @@
 // Hujjat: https://www.amocrm.ru/developers/content/chats/chat-api-reference
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { signMediaToken } from './auth.js';
+import { db } from './db.js';
 import { getAppUrl } from './links.js';
 import { vercelWaitUntil } from './redeliver.js';
-import { getSetting, setSetting } from './repo.js';
+import { deleteSetting, getSetting, setSetting } from './repo.js';
 import type { Client, Content, Message, Staff } from './types.js';
-import { clientName, describeError } from './util.js';
+import { clientName, describeError, sleep } from './util.js';
 
 const AMOJO = 'https://amojo.amocrm.ru';
 const TIMEOUT_MS = 8000;
@@ -32,6 +33,10 @@ export const amo = {
   },
   get botId(): string {
     return env('AMOCRM_BOT_ID');
+  },
+  /** REST API (lid/kontakt yaratish, javobgar biriktirish) uchun: AMOCRM_DOMAIN + AMOCRM_TOKEN (uzoq muddatli). */
+  get restEnabled(): boolean {
+    return !!(env('AMOCRM_DOMAIN') && env('AMOCRM_TOKEN'));
   },
 };
 
@@ -133,8 +138,68 @@ async function amoMessage(m: Message): Promise<Record<string, unknown>> {
   };
 }
 
-async function sendToAmo(m: Message, client: Client, staff: Staff | null): Promise<void> {
+async function amoRest(path: string, payload: unknown): Promise<unknown> {
+  const res = await fetch(`https://${env('AMOCRM_DOMAIN')}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env('AMOCRM_TOKEN')}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`amoCRM ${path}: HTTP ${res.status} ${text.slice(0, 300)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+/** Bot xodimi -> amoCRM foydalanuvchisi (settings: amo_user:<staffId> = amoCRM user id). */
+export const amoUserKey = (staffId: number): string => `amo_user:${staffId}`;
+const chatKey = (conversationId: number): string => `amo_chat:${conversationId}`;
+const PENDING = 'pending';
+
+/**
+ * Suhbatning birinchi xabaridan OLDIN: amoCRM da chat yaratiladi, xodimga (javobgar) biriktirilgan kontakt + lid
+ * ochiladi va chat kontaktga bog'lanadi — xabar «Неразобранное» ga emas, to'g'ridan-to'g'ri operator lidiga tushadi.
+ * Xodim amoCRM foydalanuvchisiga bog'lanmagan bo'lsa (yoki xato) — oddiygidek «Неразобранное» ga tushadi.
+ * shortcut: har suhbat (mijoz+operator) uchun alohida kontakt/lid; bitta mijoz 2 operatorga yozsa — 2 ta kontakt.
+ */
+async function ensureAssignedChat(conversationId: number, client: Client, staffId: number, scope: string): Promise<void> {
+  if (!amo.restEnabled) return;
+  const key = chatKey(conversationId);
+  const existing = await getSetting(key);
+  if (existing && existing !== PENDING) return;
+  const amoUser = Number(await getSetting(amoUserKey(staffId)));
+  if (!amoUser) return;
+  // Parallel xabarlar bitta lid ochsin: birinchisi «band qiladi», qolganlari tayyor bo'lishini qisqa kutadi
+  const claimed = await db()`
+    insert into settings (key, value, updated_at) values (${key}, ${PENDING}, now()) on conflict (key) do nothing returning key`;
+  if (!claimed.length) {
+    for (let i = 0; i < 10 && (await getSetting(key)) === PENDING; i++) await sleep(500);
+    return;
+  }
+  try {
+    const chat = (await amojoPost(`/v2/origin/custom/${scope}/chats`, {
+      conversation_id: amoConversationId(conversationId),
+      user: clientParticipant(client),
+    })) as { id: string };
+    const name = clientName(client);
+    const [lead] = (await amoRest('/api/v4/leads/complex', [
+      {
+        name: `Telegram: ${name}${client.username ? ` (@${client.username})` : ''}`,
+        responsible_user_id: amoUser,
+        _embedded: { contacts: [{ name, responsible_user_id: amoUser }] },
+      },
+    ])) as { id: number; contact_id: number }[];
+    if (!lead?.contact_id) throw new Error('leads/complex: contact_id qaytmadi');
+    await amoRest('/api/v4/contacts/chats', [{ chat_id: chat.id, contact_id: lead.contact_id }]);
+    await setSetting(key, JSON.stringify({ chat: chat.id, lead: lead.id, contact: lead.contact_id }));
+  } catch (e) {
+    await deleteSetting(key).catch(() => {});
+    console.error(`[amocrm] suhbat #${conversationId}: lidni operatorga biriktirib bo'lmadi:`, describeError(e));
+  }
+}
+
+async function sendToAmo(m: Message, client: Client, staff: Staff | null, staffId: number): Promise<void> {
   const scope = await scopeId();
+  await ensureAssignedChat(m.conversation_id, client, staffId, scope);
   const t = m.created_at instanceof Date ? m.created_at.getTime() : Date.now();
   const payload: Record<string, unknown> = {
     timestamp: Math.floor(t / 1000),
@@ -159,10 +224,10 @@ async function sendToAmo(m: Message, client: Client, staff: Staff | null): Promi
  * Xabarni amoCRM ga nusxalash (fonda, xatolar faqat logga — Telegram oqimini hech qachon buzmaydi).
  * staff berilsa — xodimning Telegram dagi javobi; aks holda mijoz xabari.
  */
-export function mirrorToAmo(m: Message, client: Client, staff: Staff | null = null): Promise<void> {
+export function mirrorToAmo(m: Message, client: Client, staffId: number, staff: Staff | null = null): Promise<void> {
   if (!amo.enabled) return Promise.resolve();
   if (staff && !amo.botId) return Promise.resolve();
-  const work = sendToAmo(m, client, staff).catch((e) =>
+  const work = sendToAmo(m, client, staff, staffId).catch((e) =>
     console.error(`[amocrm] xabar #${m.id} ni amoCRM ga yuborib bo'lmadi:`, describeError(e)),
   );
   const waitUntil = vercelWaitUntil();

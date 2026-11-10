@@ -1033,7 +1033,7 @@ export async function relayClientMessage(params: {
   }
 
   // shortcut: faqat ok bilan tugagan xabarlar amoCRM ga nusxalanadi; xato yo'llari (fayl katta va h.k.) — yo'q
-  await mirrorToAmo(message, client);
+  await mirrorToAmo(message, client, conversation.staff_id);
   return { ok: true, message, delivered, autoReply, ...(undeliveredReason ? { undeliveredReason } : {}) };
 }
 
@@ -1055,7 +1055,7 @@ export async function relayStaffMessage(params: {
   fromAmo?: boolean;
 }): Promise<RelayResult> {
   const { staff, conversation, content, staffChatId, staffMsgId, via, replyToStaffMsgId } = params;
-  const mirror = (m: Message, c: Client) => (params.fromAmo ? Promise.resolve() : mirrorToAmo(m, c, staff));
+  const mirror = (m: Message, c: Client) => (params.fromAmo ? Promise.resolve() : mirrorToAmo(m, c, staff.id, staff));
   if (conversation.staff_id !== staff.id) return { ok: false, error: 'forbidden' };
   // O'chirib qo'yilgan xodimga mijozlar yoza olmaydi — u ham ularga yoza olmaydi (bot va Mini App bir xil)
   if (!staffCanWrite(staff)) return { ok: false, error: 'staff_inactive' };
