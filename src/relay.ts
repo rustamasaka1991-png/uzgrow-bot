@@ -25,6 +25,7 @@
 //  - Har bir yuborilgan Telegram xabari (sarlavha, bo'laklar) saqlangan yozuvga bog'lanadi — Reply har doim
 //    to'g'ri suhbatga boradi; Reply qilingan xabar boshqa tomonda ham iqtibos sifatida ko'rinadi.
 import { HttpError, InlineKeyboard } from 'grammy';
+import { mirrorToAmo } from './amocrm.js';
 import { config } from './config.js';
 import { remainingMs } from './deadline.js';
 import { panelRecipients } from './roles.js';
@@ -1031,6 +1032,8 @@ export async function relayClientMessage(params: {
     }
   }
 
+  // shortcut: faqat ok bilan tugagan xabarlar amoCRM ga nusxalanadi; xato yo'llari (fayl katta va h.k.) — yo'q
+  await mirrorToAmo(message, client);
   return { ok: true, message, delivered, autoReply, ...(undeliveredReason ? { undeliveredReason } : {}) };
 }
 
@@ -1048,8 +1051,11 @@ export async function relayStaffMessage(params: {
   staffMsgId?: number;
   via: Via;
   replyToStaffMsgId?: number;
+  /** amoCRM dan kelgan javob — amoCRM ga qayta nusxalanmaydi. */
+  fromAmo?: boolean;
 }): Promise<RelayResult> {
   const { staff, conversation, content, staffChatId, staffMsgId, via, replyToStaffMsgId } = params;
+  const mirror = (m: Message, c: Client) => (params.fromAmo ? Promise.resolve() : mirrorToAmo(m, c, staff));
   if (conversation.staff_id !== staff.id) return { ok: false, error: 'forbidden' };
   // O'chirib qo'yilgan xodimga mijozlar yoza olmaydi — u ham ularga yoza olmaydi (bot va Mini App bir xil)
   if (!staffCanWrite(staff)) return { ok: false, error: 'staff_inactive' };
@@ -1102,6 +1108,7 @@ export async function relayStaffMessage(params: {
     );
     await linkExtras(message.id, 'client', client.tg_user_id, res);
     await clearClientBlocked(client);
+    await mirror(message, client);
     return { ok: true, message, delivered: true };
   }
 
@@ -1141,6 +1148,7 @@ export async function relayStaffMessage(params: {
   // bosilsa mijoz xabarni ikkinchi marta oladi. Ikkala yordamchi ham xato tashlamaydi.
   message = await recordClientDelivery(message, client.tg_user_id, res);
   await clearClientBlocked(client);
+  await mirror(message, client);
   return { ok: true, message, delivered: true };
 }
 
