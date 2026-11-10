@@ -817,6 +817,11 @@ html[data-scheme='dark'] .tabs-ind {
   white-space: nowrap;
 }
 
+/* Badge (masalan, yangi shikoyatlar soni) bor tabda emoji o'rniga nom to'liq sig'sin */
+.tab:has(.count:not([hidden])) .tab-emoji {
+  display: none;
+}
+
 .tab .count {
   min-width: 18px;
   height: 18px;

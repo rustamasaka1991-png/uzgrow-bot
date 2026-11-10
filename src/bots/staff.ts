@@ -4,7 +4,7 @@ import { Bot, Composer, InlineKeyboard, type BotError, type CommandContext, type
 import type { Message as TgMessage } from 'grammy/types';
 import { config } from '../config.js';
 import { db } from '../db.js';
-import { getWebAppUrl } from '../links.js';
+import { getWebAppUrl, initBotFast } from '../links.js';
 import {
   handleStaffReachable,
   relayErrorText,
@@ -81,7 +81,7 @@ export async function getStaffBot(): Promise<Bot> {
   if (!botPromise) {
     const p = (async () => {
       const bot = createStaffBot();
-      await bot.init();
+      await initBotFast(bot, config.staffBotToken);
       return bot as unknown as Bot;
     })();
     botPromise = p;

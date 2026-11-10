@@ -4191,7 +4191,7 @@
     const moreWrap = h('div', { class: 'list-more', hidden: true }, h('button', { class: 'btn sm secondary', type: 'button', onclick: () => load(false) }, "⬇️ Ko'proq yuklash"));
     const refreshBtn = h('button', { class: 'icon-btn accent', type: 'button', 'aria-label': 'Yangilash', onclick: () => load(true) }, icon('refresh'));
     append(container, [
-      h('div', { class: 'sec-title' }, [h('span', { text: '⚠️ Shikoyatlar — faqat oʻqish va hal qilish' }), refreshBtn]),
+      h('div', { class: 'sec-title' }, [h('span', { text: '⚠️ Shikoyatlar' }), refreshBtn]),
       filterEl,
       listEl,
       stateEl,
@@ -4216,15 +4216,15 @@
         listEl.appendChild(h('div', { class: 'center-state', style: 'padding:22px 16px' }, [h('span', { text: filter === 'new' ? "Yangi shikoyatlar yo'q 🎉" : "Hozircha shikoyatlar yo'q 🎉" })]));
       }
       items.forEach((c) => {
-        const icon = c.status === 'new' ? '🆕' : '✅';
+        const mark = c.status === 'new' ? '🆕' : '✅';
         listEl.appendChild(
           h('button', { class: 'row', type: 'button', onclick: () => nav.push(ComplaintScreen(c.id)) }, [
             h('div', { class: 'row-main' }, [
               h('div', { class: 'row-top' }, [
-                h('span', { class: 'row-name', text: '#' + c.id + ' ' + icon + ' ' + c.staff_name }),
+                h('span', { class: 'row-name', text: '#' + c.id + ' ' + mark + ' ' + c.staff_name }),
                 h('span', { class: 'row-time', text: listTime(c.submitted_at) }),
               ]),
-              h('div', { class: 'row-sub', text: c.client_name + (c.client_username ? ' ( @' + c.client_username + ' )' : '') + ' · ' + clip(c.text, 80) }),
+              h('div', { class: 'row-sub', text: c.client_name + (c.client_username ? ' (@' + c.client_username + ')' : '') + ' · ' + clip(c.text, 80) }),
             ]),
             icon('chev', 'chev'),
           ]),
@@ -4376,7 +4376,7 @@
     const listEl = h('div', { class: 'list' });
     const stateEl = h('div', { class: 'center-state', hidden: true });
     append(container, [
-      h('div', { class: 'sec-title' }, h('span', { text: '👁 Chatlar kuzatuvi — faqat oʻqish' })),
+      h('div', { class: 'sec-title' }, h('span', { text: '👁 Chatlar kuzatuvi' })),
       listEl,
       stateEl,
       h('p', { class: 'legend', text: "🔒 Sizga xabarlar kelmaydi — faqat kirib oʻqiysiz. Yozib boʻlmaydi." }),
@@ -4388,6 +4388,7 @@
         const sub = (s.linked ? (s.is_active ? '🟢 Faol' : '🚫 Bloklangan') : '⏳ Ulanmagan');
         listEl.appendChild(
           h('button', { class: 'row', type: 'button', onclick: () => nav.push(WatchConvsScreen(s)) }, [
+            avatar({ name: s.full_name, seed: s.id, url: s.photo_url, size: 44, lazy: true, online: s.linked && s.is_active ? s.is_online : undefined }),
             h('div', { class: 'row-main' }, [
               h('div', { class: 'row-top' }, [h('span', { class: 'row-name', text: s.full_name })]),
               h('div', { class: 'row-sub', text: sub }),
@@ -4415,7 +4416,7 @@
     }
 
     function applyWatchStaff(res) {
-      staff = arr(res.staff).map((s) => ({ id: num(s.id), full_name: str(s.full_name) || 'Xodim', role: s.role, is_active: s.is_active !== false, linked: !!s.linked })).filter((s) => s.id);
+      staff = arr(res.staff).map((s) => ({ id: num(s.id), full_name: str(s.full_name) || 'Xodim', role: s.role, is_active: s.is_active !== false, is_online: s.is_online === true, linked: !!s.linked, photo_url: s.photo_url || null })).filter((s) => s.id);
       loaded = true;
     }
 

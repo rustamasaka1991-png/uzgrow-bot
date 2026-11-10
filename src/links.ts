@@ -70,3 +70,22 @@ export async function staffDeepLink(staffId: number): Promise<string> {
   const s = await getStaff(staffId);
   return staffClientLink({ id: staffId, link_code: s?.link_code ?? null });
 }
+
+/**
+ * grammY bot.init() o'rniga: getMe natijasi bazada keshlanadi — har sovuq startda Telegram'ga (Yevropa) borilmaydi.
+ * shortcut: bot username/sozlamasi o'zgarsa kesh eskiradi — settings dan `bot_info:<id>` ni o'chiring.
+ */
+export async function initBotFast(bot: { init(): Promise<void>; botInfo: unknown }, token: string): Promise<void> {
+  const key = `bot_info:${token.split(':')[0]}`;
+  const raw = await getSetting(key).catch(() => null);
+  if (raw) {
+    try {
+      bot.botInfo = JSON.parse(raw);
+      return;
+    } catch {
+      /* buzilgan kesh — qayta olamiz */
+    }
+  }
+  await bot.init();
+  await setSetting(key, JSON.stringify(bot.botInfo)).catch(() => {});
+}

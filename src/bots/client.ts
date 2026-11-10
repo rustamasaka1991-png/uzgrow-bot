@@ -22,6 +22,7 @@ import {
   type ComplaintView,
 } from '../complaints.js';
 import { config } from '../config.js';
+import { initBotFast } from '../links.js';
 import { relayErrorText } from '../relay.js';
 import {
   clearLegacyKeyboard,
@@ -1374,7 +1375,7 @@ let botReady: Promise<Bot> | null = null;
 export async function getClientBot(): Promise<Bot> {
   if (!botReady) {
     const bot = botInstance ?? (botInstance = createClientBot());
-    botReady = bot.init().then(
+    botReady = initBotFast(bot, config.clientBotToken).then(
       () => bot,
       (e: unknown) => {
         botReady = null;

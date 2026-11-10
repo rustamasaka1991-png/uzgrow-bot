@@ -89,6 +89,7 @@ import {
   type ConvSummaryDTO,
   type MessageDTO,
   type MessageDTOSource,
+  staffPhotoUrl,
 } from './dto.js';
 import { MAX_UPLOAD_BYTES, classifyUpload, extForMime, redact, sniffImage } from './files.js';
 import { claimSend, completeSend, hitRateLimit, releaseSend, type RateRule } from './guards.js';
@@ -1632,6 +1633,7 @@ async function watchStaff(ctx: Ctx): Promise<Data> {
       is_active: st.is_active,
       is_online: st.is_online,
       linked: st.tg_user_id != null,
+      photo_url: staffPhotoUrl(st.id, st),
     })),
   };
 }
