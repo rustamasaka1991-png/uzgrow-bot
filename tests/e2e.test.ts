@@ -124,6 +124,8 @@ delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
 // /api/setup preview deploymentida ishlamaydi — test muhiti production kabi
 delete process.env.VERCEL_ENV;
 delete process.env.MEDIA_SECRET;
+// Testlar haqiqiy amoCRM ga hech narsa yubormasin (.env da kalitlar bo'lsa ham)
+for (const k of Object.keys(process.env)) if (k.startsWith('AMOCRM_')) delete process.env[k];
 
 // ───────────────────────────── Fon yetkazish chaqiruvlari (POST /api/redeliver) ─────────────────────────────
 
