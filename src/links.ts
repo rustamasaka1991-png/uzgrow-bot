@@ -36,6 +36,8 @@ export async function getWebAppUrl(): Promise<string> {
 const usernameCache: Partial<Record<'client' | 'staff', string>> = {};
 
 export async function botUsername(bot: 'client' | 'staff'): Promise<string> {
+  // Bitta bot rejimi: xodimlar ham mijozlar botida ishlaydi — taklif havolasi ham o'sha botga
+  if (bot === 'staff' && config.singleBot) bot = 'client';
   if (usernameCache[bot]) return usernameCache[bot]!;
   const key = bot === 'client' ? 'client_bot_username' : 'staff_bot_username';
   const saved = await getSetting(key);
